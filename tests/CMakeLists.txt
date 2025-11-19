@@ -1,0 +1,5 @@
+add_executable(test_book_basic test_book_basic.cpp)
+target_link_libraries(test_book_basic PRIVATE tape_book)
+target_compile_features(test_book_basic PRIVATE cxx_std_20)
+
+add_test(NAME test_book_basic COMMAND test_book_basic)
