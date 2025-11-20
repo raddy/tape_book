@@ -1,9 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 project(tape_book LANGUAGES CXX)
 
-option(TAPE_BOOK_BUILD_TESTS "Build tape_book tests" ON)
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    option(TAPE_BOOK_BUILD_TESTS "Build tape_book tests" ON)
+else()
+    option(TAPE_BOOK_BUILD_TESTS "Build tape_book tests" OFF)
+endif()
 
 add_library(tape_book INTERFACE)
+add_library(tape_book::tape_book ALIAS tape_book)
+
 target_include_directories(tape_book INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>

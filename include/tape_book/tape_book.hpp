@@ -5,6 +5,7 @@
 #include "tape_book/spill_buffer.hpp"
 #include "tape_book/tape.hpp"
 #include "tape_book/book.hpp"
+#include "tape_book/multi_book_pool.hpp"
 
 namespace tape_book {
 
