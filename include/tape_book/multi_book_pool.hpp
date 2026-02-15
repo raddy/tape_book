@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <memory>
 #include <cstdint>
 #include <cassert>
 
@@ -16,53 +17,67 @@ enum class BookTier : std::uint8_t {
 template <
     typename PriceT,
     typename QtyT,
-    i32 N_HIGH,   i32 CAP_HIGH,
-    i32 N_MEDIUM, i32 CAP_MEDIUM,
-    i32 N_LOW,    i32 CAP_LOW,
-    class HighAlloc   = std::allocator<Book<N_HIGH,   CAP_HIGH,   PriceT, QtyT>>,
-    class MediumAlloc = std::allocator<Book<N_MEDIUM, CAP_MEDIUM, PriceT, QtyT>>,
-    class LowAlloc    = std::allocator<Book<N_LOW,    CAP_LOW,    PriceT, QtyT>>>
+    i32 N_HIGH,
+    i32 N_MEDIUM,
+    i32 N_LOW,
+    class HighAlloc   = std::allocator<Book<N_HIGH,   PriceT, QtyT>>,
+    class MediumAlloc = std::allocator<Book<N_MEDIUM, PriceT, QtyT>>,
+    class LowAlloc    = std::allocator<Book<N_LOW,    PriceT, QtyT>>>
 struct MultiBookPool3 {
   using price_type = PriceT;
   using qty_type   = QtyT;
 
-  using HighBook   = Book<N_HIGH,   CAP_HIGH,   price_type, qty_type>;
-  using MediumBook = Book<N_MEDIUM, CAP_MEDIUM, price_type, qty_type>;
-  using LowBook    = Book<N_LOW,    CAP_LOW,    price_type, qty_type>;
+  using HighBook   = Book<N_HIGH,   price_type, qty_type>;
+  using MediumBook = Book<N_MEDIUM, price_type, qty_type>;
+  using LowBook    = Book<N_LOW,    price_type, qty_type>;
 
   struct Handle {
     BookTier       tier;
     std::uint32_t  idx;
   };
 
+  using pool_type = SpillPool<price_type, qty_type>;
+
+  // pool_ declared BEFORE book vectors — destruction is reverse order,
+  // so books are destroyed before the pool they reference.
+  std::unique_ptr<pool_type> pool_;
+
   std::vector<HighBook,   HighAlloc>   high_;
   std::vector<MediumBook, MediumAlloc> medium_;
   std::vector<LowBook,    LowAlloc>    low_;
 
-  constexpr MultiBookPool3() = default;
+  i32 default_max_cap_{4096};
+
+  MultiBookPool3() = default;
+  explicit MultiBookPool3(i32 max_cap, i32 pool_cap = 0) noexcept
+      : pool_(pool_cap > 0 ? new pool_type(pool_cap) : nullptr),
+        default_max_cap_(max_cap) {}
 
   TB_ALWAYS_INLINE void reserve_high(std::size_t n)   { high_.reserve(n); }
   TB_ALWAYS_INLINE void reserve_medium(std::size_t n) { medium_.reserve(n); }
   TB_ALWAYS_INLINE void reserve_low(std::size_t n)    { low_.reserve(n); }
 
   [[nodiscard]] TB_ALWAYS_INLINE Handle alloc(BookTier tier,
-                                               price_type anchor_px = price_type{0}) {
+                                               price_type anchor_px = price_type{0},
+                                               i32 max_cap = 0) {
+    if (max_cap == 0) max_cap = default_max_cap_;
+    auto* p = pool_.get();
     switch (tier) {
       case BookTier::High: {
         const std::uint32_t idx = static_cast<std::uint32_t>(high_.size());
-        high_.emplace_back();
+        high_.emplace_back(max_cap, p);
         high_.back().reset(anchor_px);
         return Handle{BookTier::High, idx};
       }
       case BookTier::Medium: {
         const std::uint32_t idx = static_cast<std::uint32_t>(medium_.size());
-        medium_.emplace_back();
+        medium_.emplace_back(max_cap, p);
         medium_.back().reset(anchor_px);
         return Handle{BookTier::Medium, idx};
       }
       case BookTier::Low: {
         const std::uint32_t idx = static_cast<std::uint32_t>(low_.size());
-        low_.emplace_back();
+        low_.emplace_back(max_cap, p);
         low_.back().reset(anchor_px);
         return Handle{BookTier::Low, idx};
       }
