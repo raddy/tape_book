@@ -2,34 +2,42 @@
 #include "tape_book/config.hpp"
 #include "tape_book/types.hpp"
 #include "tape_book/spill_buffer.hpp"
+#include "tape_book/spill_pool.hpp"
 #include "tape_book/tape.hpp"
 
 namespace tape_book {
 
-template <i32 N, class SpillBuf>
+template <i32 N, typename PriceT, typename QtyT>
 struct TapeBook {
-  using price_type = typename SpillBuf::price_type;
-  using qty_type   = typename SpillBuf::qty_type;
+  using price_type = PriceT;
+  using qty_type   = QtyT;
 
   static constexpr i32 N32 = static_cast<i32>(N);
   static constexpr i64 N64 = static_cast<i64>(N);
 
   [[nodiscard]] static constexpr price_type compute_anchor(price_type px, i64 offset) noexcept {
     constexpr auto min_px = std::numeric_limits<price_type>::lowest();
-    constexpr auto min_anchor = min_px + (N64 - 1);
-    return (px < min_px + offset) ? min_anchor : px - offset;
+    constexpr auto max_px = std::numeric_limits<price_type>::max();
+    constexpr auto min_anchor = static_cast<price_type>(min_px + (N64 - 1));
+    constexpr auto max_anchor = static_cast<price_type>(max_px - (N64 - 1));
+    if (px < min_px + offset) return min_anchor;
+    // px - offset is computed in i64 due to offset being i64
+    i64 result = static_cast<i64>(px) - offset;
+    return (result > max_anchor) ? max_anchor : static_cast<price_type>(result);
   }
 
   Tape<N, true,  price_type, qty_type> bids;
   Tape<N, false, price_type, qty_type> asks;
-  SpillBuf& spill_buffer;
+  DynSpillBuffer<price_type, qty_type> spill;
 
-  explicit TapeBook(SpillBuf& sb) : spill_buffer(sb) {}
+  explicit TapeBook(i32 max_cap = 4096,
+                    SpillPool<price_type, qty_type>* pool = nullptr) noexcept
+      : spill(max_cap, pool) {}
 
   TB_ALWAYS_INLINE void reset(price_type anchor) noexcept {
     bids.reset(anchor);
     asks.reset(anchor);
-    spill_buffer.clear();
+    spill.clear();
   }
 
   template <bool IsBid>
@@ -41,66 +49,58 @@ struct TapeBook {
 
   [[nodiscard]] TB_ALWAYS_INLINE price_type best_bid_px() const noexcept {
     const auto tape_best = bids.best_px();
-    const auto spill_best = spill_buffer.template best_px<true>();
+    const auto spill_best = spill.template best_px<true>();
     return (tape_best > spill_best) ? tape_best : spill_best;
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE price_type best_ask_px() const noexcept {
     const auto tape_best = asks.best_px();
-    const auto spill_best = spill_buffer.template best_px<false>();
+    const auto spill_best = spill.template best_px<false>();
     return (tape_best < spill_best) ? tape_best : spill_best;
-  }
-
-  template <bool IsBid>
-  [[nodiscard]] TB_ALWAYS_INLINE price_type best_px() const noexcept {
-    if constexpr (IsBid) return bids.best_px();
-    else                 return asks.best_px();
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE qty_type best_bid_qty() const noexcept {
     const auto tape_best  = bids.best_px();
-    const auto spill_best = spill_buffer.template best_px<true>();
-    return (tape_best > spill_best)
+    const auto spill_best = spill.template best_px<true>();
+    return (tape_best >= spill_best)
            ? bids.best_qty()
-           : spill_buffer.template best_qty<true>();
+           : spill.template best_qty<true>();
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE qty_type best_ask_qty() const noexcept {
     const auto tape_best  = asks.best_px();
-    const auto spill_best = spill_buffer.template best_px<false>();
-    return (tape_best < spill_best)
+    const auto spill_best = spill.template best_px<false>();
+    return (tape_best <= spill_best)
            ? asks.best_qty()
-           : spill_buffer.template best_qty<false>();
+           : spill.template best_qty<false>();
   }
-
-  [[nodiscard]] TB_ALWAYS_INLINE i32 bid_headroom_dn(i32 H = 0) const noexcept { return bids.headroom_dn(H); }
-  [[nodiscard]] TB_ALWAYS_INLINE i32 ask_headroom_up(i32 H = 0) const noexcept { return asks.headroom_up(H); }
 
   template <bool IsBid>
   TB_ALWAYS_INLINE void erase_better(price_type px) noexcept {
-    if constexpr (IsBid) bids.erase_better(px, spill_buffer);
-    else                 asks.erase_better(px, spill_buffer);
+    if constexpr (IsBid) bids.erase_better(px, spill);
+    else                 asks.erase_better(px, spill);
   }
 
   template <bool IsBid, typename TapeT>
   [[nodiscard]] TB_ALWAYS_INLINE UpdateResult
   set_impl(TapeT& tape, price_type px, qty_type q) noexcept {
-    auto rc = tape.set_qty(px, q, spill_buffer);
+    auto rc = tape.set_qty(px, q, spill);
     if (TB_LIKELY(rc != UpdateResult::Promote)) return rc;
 
     price_type A = compute_anchor(px, N64 / 2);
     const price_type minA = compute_anchor(px, N64 - 1);
     if (A < minA) A = minA;
     if (A > px)   A = px;
+    TB_ASSUME(A >= TapeT::min_valid_anchor() && A <= TapeT::max_valid_anchor());
 
-    tape.recenter_to_anchor(A, spill_buffer);
+    tape.recenter_to_anchor(A, spill);
 
     const price_type lo = tape.anchor();
     const price_type hi =
         static_cast<price_type>(static_cast<i64>(lo) + N32 - 1);
 
     NullSink nospill;
-    spill_buffer.template drain<IsBid>(lo, hi, [&](price_type p, qty_type qq) {
+    spill.template drain<IsBid>(lo, hi, [&](price_type p, qty_type qq) {
       (void)tape.set_qty(p, qq, nospill);
     });
 
@@ -120,27 +120,23 @@ struct TapeBook {
   }
 
   TB_ALWAYS_INLINE void recenter_bid(price_type new_anchor) noexcept {
-    bids.recenter_to_anchor(new_anchor, spill_buffer);
+    bids.recenter_to_anchor(new_anchor, spill);
     const price_type lo = bids.anchor();
     const price_type hi = static_cast<price_type>(static_cast<i64>(lo) + N32 - 1);
     NullSink nospill;
-    spill_buffer.template drain<true>(lo, hi, [&](price_type px, qty_type q) {
+    spill.template drain<true>(lo, hi, [&](price_type px, qty_type q) {
       (void)bids.set_qty(px, q, nospill);
     });
   }
 
   TB_ALWAYS_INLINE void recenter_ask(price_type new_anchor) noexcept {
-    asks.recenter_to_anchor(new_anchor, spill_buffer);
+    asks.recenter_to_anchor(new_anchor, spill);
     const price_type lo = asks.anchor();
     const price_type hi = static_cast<price_type>(static_cast<i64>(lo) + N32 - 1);
     NullSink nospill;
-    spill_buffer.template drain<false>(lo, hi, [&](price_type px, qty_type q) {
+    spill.template drain<false>(lo, hi, [&](price_type px, qty_type q) {
       (void)asks.set_qty(px, q, nospill);
     });
-  }
-
-  [[nodiscard]] TB_ALWAYS_INLINE bool anchors_equal() const noexcept {
-    return bids.anchor() == asks.anchor();
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE bool crossed_on_tape() const noexcept {
@@ -153,19 +149,24 @@ struct TapeBook {
 };
 
 template <i32 N,
-          i32 CAP,
           typename PriceT,
           typename QtyT>
 struct Book {
   using price_type = PriceT;
   using qty_type   = QtyT;
-  using Spill      = SpillBuffer<CAP, PriceT, QtyT>;
-  using Core       = TapeBook<N, Spill>;
+  using Core       = TapeBook<N, PriceT, QtyT>;
 
-  Spill spill;
-  Core  core;
+  Core core;
 
-  Book() : spill(), core(spill) {}
+  explicit Book(i32 max_cap = 4096,
+                SpillPool<price_type, qty_type>* pool = nullptr) noexcept
+      : core(max_cap, pool) {}
+
+  Book(const Book&) = delete;
+  Book& operator=(const Book&) = delete;
+
+  Book(Book&&) noexcept = default;
+  Book& operator=(Book&&) noexcept = default;
 
   TB_ALWAYS_INLINE void reset(price_type anchor_px) noexcept { core.reset(anchor_px); }
 

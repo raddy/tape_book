@@ -13,3 +13,5 @@
 #  define TB_LIKELY(x)   (x)
 #  define TB_UNLIKELY(x) (x)
 #endif
+
+#define TB_ASSUME(expr) do { if (!(expr)) __builtin_unreachable(); } while(0)

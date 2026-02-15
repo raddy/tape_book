@@ -1,5 +1,19 @@
 add_executable(test_book_basic test_book_basic.cpp)
 target_link_libraries(test_book_basic PRIVATE tape_book)
 target_compile_features(test_book_basic PRIVATE cxx_std_20)
-
 add_test(NAME test_book_basic COMMAND test_book_basic)
+
+add_executable(test_fuzz test_fuzz.cpp)
+target_link_libraries(test_fuzz PRIVATE tape_book)
+target_compile_features(test_fuzz PRIVATE cxx_std_20)
+add_test(NAME test_fuzz COMMAND test_fuzz)
+
+add_executable(test_multi_book_pool test_multi_book_pool.cpp)
+target_link_libraries(test_multi_book_pool PRIVATE tape_book)
+target_compile_features(test_multi_book_pool PRIVATE cxx_std_20)
+add_test(NAME test_multi_book_pool COMMAND test_multi_book_pool)
+
+add_executable(test_spill_pool test_spill_pool.cpp)
+target_link_libraries(test_spill_pool PRIVATE tape_book)
+target_compile_features(test_spill_pool PRIVATE cxx_std_20)
+add_test(NAME test_spill_pool COMMAND test_spill_pool)

@@ -1,15 +1,18 @@
 #include <cassert>
+#include <climits>
 #include <ranges>
 #include "tape_book/tape_book.hpp"
 
 using namespace tape_book;
 
+// Book<1024> should be ~8.5 KB (tape data + inline spill metadata), not ~72 KB
+static_assert(sizeof(Book<1024, i32, u32>) < 9000);
+
 static constexpr auto N = 256;
-static constexpr auto CAP = 512;
-using BookT = Book<N, CAP, i32, u32>;
+using BookT = Book<N, i32, u32>;
 
 static void test_basic_operations() {
-  BookT b;
+  BookT b(512);
   b.reset(1000);
 
   assert(b.set<true>(1005, 10) == UpdateResult::Insert);
@@ -24,7 +27,7 @@ static void test_basic_operations() {
   assert(b.set<true>(1005, 0) == UpdateResult::Erase);
   assert(b.best_bid_px() == lowest_px<i32>() && b.best_bid_qty() == 0);
 
-  assert(b.set<true>(1005, 0) == UpdateResult::Update);
+  assert(b.set<true>(1005, 0) == UpdateResult::Erase);
 
   b.reset(1000);
   b.set<true>(1000, 10);
@@ -52,7 +55,7 @@ static void test_basic_operations() {
 }
 
 static void test_spill_buffer() {
-  BookT b;
+  BookT b(512);
   b.reset(1000);
 
   b.set<true>(1100, 10);
@@ -77,7 +80,7 @@ static void test_spill_buffer() {
 }
 
 static void test_crossed_states() {
-  BookT b;
+  BookT b(512);
   b.reset(1000);
 
   b.set<true>(1000, 10);
@@ -100,7 +103,7 @@ static void test_crossed_states() {
 }
 
 static void test_erase_better() {
-  BookT b;
+  BookT b(512);
   b.reset(1000);
 
   b.set<true>(1000, 10);
@@ -137,7 +140,7 @@ static void test_erase_better() {
 }
 
 static void test_anchor_and_recentering() {
-  BookT b;
+  BookT b(512);
   b.reset(1000);
 
   b.set<true>(1100, 10);
@@ -166,7 +169,7 @@ static void test_anchor_and_recentering() {
 }
 
 static void test_edge_cases() {
-  BookT b;
+  BookT b(512);
   b.reset(1000);
 
   b.set<true>(1000, UINT32_MAX);
@@ -201,7 +204,7 @@ static void test_edge_cases() {
 }
 
 static void test_sequences() {
-  BookT b;
+  BookT b(512);
   b.reset(1000);
 
   for (auto i : std::views::iota(0, 20))
@@ -230,6 +233,119 @@ static void test_sequences() {
   assert(b.verify_invariants());
 }
 
+static void test_compute_anchor_clamp() {
+  // N=256 for BookT, so N64=256, N64-1=255
+  using Core = BookT::Core;
+
+  // Upper boundary: compute_anchor(INT32_MAX, 32) must not exceed max_anchor = INT32_MAX - 255
+  {
+    constexpr auto max_anchor = std::numeric_limits<i32>::max() - (256 - 1);
+    auto anchor = Core::compute_anchor(INT32_MAX, 32);
+    assert(anchor <= max_anchor);
+    // INT32_MAX - 32 = 2147483615, max_anchor = 2147483392
+    // So it should be clamped to max_anchor
+    assert(anchor == max_anchor);
+  }
+
+  // Lower boundary: compute_anchor(INT32_MIN, 32) must not go below min_anchor = INT32_MIN + 255
+  {
+    constexpr auto min_anchor = std::numeric_limits<i32>::lowest() + (256 - 1);
+    auto anchor = Core::compute_anchor(INT32_MIN, 32);
+    assert(anchor >= min_anchor);
+    // INT32_MIN < INT32_MIN + 32 triggers the lower clamp
+    assert(anchor == min_anchor);
+  }
+
+  // Edge case: compute_anchor(INT32_MAX, 0)
+  {
+    constexpr auto max_anchor = std::numeric_limits<i32>::max() - (256 - 1);
+    auto anchor = Core::compute_anchor(INT32_MAX, 0);
+    // INT32_MAX - 0 = INT32_MAX > max_anchor, so clamped
+    assert(anchor == max_anchor);
+  }
+
+  // Normal case: result within valid range
+  {
+    auto anchor = Core::compute_anchor(1000, 128);
+    assert(anchor == 1000 - 128);
+  }
+
+  // compute_anchor(INT32_MIN + 256, 0) — should return INT32_MIN + 256 (>= min_anchor and within max)
+  {
+    constexpr auto min_anchor = std::numeric_limits<i32>::lowest() + 255;
+    auto anchor = Core::compute_anchor(std::numeric_limits<i32>::lowest() + 256, 0);
+    // result = INT32_MIN + 256 - 0 = INT32_MIN + 256
+    // min_anchor = INT32_MIN + 255, max_anchor = INT32_MAX - 255
+    // INT32_MIN + 256 > min_anchor, INT32_MIN + 256 < max_anchor
+    assert(anchor == std::numeric_limits<i32>::lowest() + 256);
+    (void)min_anchor;
+  }
+}
+
+static void test_boundary_integration() {
+  // Integration test: Book near INT32_MAX
+  {
+    using SmallBook = Book<64, i32, u32>;
+    // max valid anchor for Tape<64> = INT32_MAX - 63
+    constexpr i32 max_anchor = std::numeric_limits<i32>::max() - 63;
+    SmallBook b(512);
+    b.reset(max_anchor);
+    // Set at INT32_MAX (index = INT32_MAX - max_anchor = 63, which is valid)
+    auto r1 = b.set<true>(std::numeric_limits<i32>::max(), 10u);
+    assert(r1 == UpdateResult::Insert);
+    assert(b.best_bid_px() == std::numeric_limits<i32>::max());
+    // Set at INT32_MAX - 1
+    auto r2 = b.set<true>(std::numeric_limits<i32>::max() - 1, 5u);
+    assert(r2 == UpdateResult::Insert);
+    assert(b.best_bid_px() == std::numeric_limits<i32>::max());
+    assert(b.best_bid_qty() == 10u);
+    assert(b.verify_invariants());
+  }
+
+  // Integration test: Book near INT32_MIN
+  {
+    using SmallBook = Book<64, i32, u32>;
+    // min valid anchor for Tape<64> = INT32_MIN + 63
+    constexpr i32 min_anchor = std::numeric_limits<i32>::lowest() + 63;
+    SmallBook b(512);
+    b.reset(min_anchor);
+    // Set at min_anchor (index 0, valid)
+    auto r1 = b.set<false>(min_anchor, 10u);
+    assert(r1 == UpdateResult::Insert);
+    assert(b.best_ask_px() == min_anchor);
+    // Set at min_anchor + 1
+    auto r2 = b.set<false>(min_anchor + 1, 5u);
+    assert(r2 == UpdateResult::Insert);
+    // Best ask should be min_anchor (lowest price ask is best)
+    assert(b.best_ask_px() == min_anchor);
+    assert(b.best_ask_qty() == 10u);
+    assert(b.verify_invariants());
+  }
+}
+
+static void test_nullsink_interface() {
+  // Compile-time smoke test: NullSink must satisfy the Sink interface
+  // for Tape::erase_better and Tape::iterate_from_best.
+  using TapeT = Tape<256, true, i32, u32>;
+  TapeT tape;
+  tape.reset(1000);
+  (void)tape.set_qty(1050, 10u, NullSink{});
+
+  NullSink sink;
+  tape.erase_better(1040, sink);
+
+  (void)tape.set_qty(1020, 5u, NullSink{});
+  tape.iterate_from_best([](i32, u32) { return true; }, sink);
+
+  // Also test ask-side instantiation
+  using TapeAsk = Tape<256, false, i32, u32>;
+  TapeAsk ask_tape;
+  ask_tape.reset(1000);
+  (void)ask_tape.set_qty(1050, 10u, NullSink{});
+  ask_tape.erase_better(1060, sink);
+  ask_tape.iterate_from_best([](i32, u32) { return true; }, sink);
+}
+
 int main() {
   test_basic_operations();
   test_spill_buffer();
@@ -238,5 +354,8 @@ int main() {
   test_anchor_and_recentering();
   test_edge_cases();
   test_sequences();
+  test_compute_anchor_clamp();
+  test_boundary_integration();
+  test_nullsink_interface();
   return 0;
 }

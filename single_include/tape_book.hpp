@@ -14,6 +14,8 @@
 #  define TB_UNLIKELY(x) (x)
 #endif
 
+#define TB_ASSUME(expr) do { if (!(expr)) __builtin_unreachable(); } while(0)
+
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -51,151 +53,253 @@ template <typename PriceT>
 
 }  // namespace tape_book
 
+#include <cstdlib>
 #include <cstring>
 
 namespace tape_book {
 
-template <i32 CAP, typename PriceT, typename QtyT>
-struct SpillBuffer {
-  static_assert(CAP > 0);
-  static_assert(std::is_integral_v<PriceT> && std::is_signed_v<PriceT>);
-  static_assert(std::is_integral_v<QtyT>   && std::is_unsigned_v<QtyT>);
+// Forward declaration — full definition in spill_pool.hpp.
+template <typename PriceT, typename QtyT>
+struct SpillPool;
 
+struct NullSink {
+  template <bool IsBid>
+  TB_ALWAYS_INLINE void push(auto, auto) noexcept {}
+  template <bool IsBid>
+  TB_ALWAYS_INLINE void erase_better(auto) noexcept {}
+  template <bool IsBid, class Fn>
+  TB_ALWAYS_INLINE void iterate_pending(Fn&&) const noexcept {}
+  TB_ALWAYS_INLINE void clear() noexcept {}
+};
+
+// Dynamically-allocated spill side. Grows from 0 up to max_cap using malloc/free.
+// When full (n == cap == max_cap), worst level is evicted (lowest bid, highest ask).
+template <typename PriceT, typename QtyT>
+struct SideDynamic {
   using level_type = LevelT<PriceT, QtyT>;
   using price_type = PriceT;
   using qty_type   = QtyT;
+  using pool_type  = SpillPool<PriceT, QtyT>;
 
-  struct SideFlat {
-    level_type a[CAP];
-    i32        n{0};
+  level_type* a{nullptr};
+  i32 n{0};
+  i32 cap{0};
+  i32 max_cap;
 
-    [[nodiscard]] constexpr TB_ALWAYS_INLINE i32 lb(price_type px) const noexcept {
-      i32 lo = 0, hi = n;
-      while (lo < hi) {
-        i32 mid = (lo + hi) >> 1;
-        if (a[mid].px < px) lo = mid + 1;
-        else hi = mid;
-      }
-      return lo;
+  explicit SideDynamic(i32 mc) noexcept : max_cap(mc) {}
+
+  [[nodiscard]] constexpr TB_ALWAYS_INLINE i32 lb(price_type px) const noexcept {
+    i32 lo = 0, hi = n;
+    while (lo < hi) {
+      i32 mid = (lo + hi) >> 1;
+      if (a[mid].px < px) lo = mid + 1;
+      else hi = mid;
     }
+    return lo;
+  }
 
-    template <bool IsBid>
-    TB_ALWAYS_INLINE void add_point(price_type px, qty_type q) noexcept {
-      const i32 i = lb(px);
-      if (i < n && a[i].px == px) {
-        if (q == qty_type{0}) {
-          if (i + 1 < n)
-            std::memmove(&a[i], &a[i + 1], (size_t)(n - i - 1) * sizeof(level_type));
-          --n;
-        } else {
-          a[i].qty = q;
-        }
-        return;
-      }
-
-      if (q == qty_type{0}) return;
-
-      if (n == CAP) {
-        if constexpr (IsBid) {
-          if (px <= a[0].px) return;
-          if (n > 1)
-            std::memmove(&a[0], &a[1], (size_t)(n - 1) * sizeof(level_type));
-          --n;
-        } else {
-          if (px >= a[n - 1].px) return;
-          --n;
-        }
-      }
-
-      const i32 j = lb(px);
-      if (j < n)
-        std::memmove(&a[j + 1], &a[j], (size_t)(n - j) * sizeof(level_type));
-      a[j] = level_type{px, q};
-      ++n;
-    }
-
-    template <class Sink>
-    TB_ALWAYS_INLINE void drain_range(price_type lo_px, price_type hi_px, Sink&& sink) noexcept {
-      if (n == 0) return;
-      const i32 L = lb(lo_px);
-      i32 R = L;
-      while (R < n && a[R].px <= hi_px) {
-        if (a[R].qty) sink(a[R].px, a[R].qty);
-        ++R;
-      }
-      if (L < R) {
-        const i32 keepR = n - R;
-        if (keepR > 0)
-          std::memmove(&a[L], &a[R], (size_t)keepR * sizeof(level_type));
-        n = L + keepR;
+  TB_ALWAYS_INLINE void ensure_cap(pool_type* pool) noexcept {
+    i32 new_cap = cap ? cap * 2 : 16;
+    if (new_cap > max_cap) new_cap = max_cap;
+    if (new_cap <= cap) return;
+    level_type* p;
+    if (pool) {
+      p = pool->reallocate(a, cap, new_cap, n);
+    } else {
+      p = static_cast<level_type*>(std::malloc(static_cast<size_t>(new_cap) * sizeof(level_type)));
+      if (!p) return;
+      if (a) {
+        std::memcpy(p, a, static_cast<size_t>(n) * sizeof(level_type));
+        std::free(a);
       }
     }
+    if (!p) return;
+    a = p;
+    cap = new_cap;
+  }
 
-    template <bool IsBid>
-    TB_ALWAYS_INLINE void erase_better(price_type th) noexcept {
-      if (n == 0) return;
-      i32 w = 0;
-      if constexpr (IsBid) {
-        for (i32 i = 0; i < n; ++i) {
-          if (!(a[i].px >= th)) {
-            if (w != i) a[w] = a[i];
-            ++w;
-          }
-        }
+  template <bool IsBid>
+  TB_ALWAYS_INLINE void add_point(price_type px, qty_type q, pool_type* pool) noexcept {
+    if (n == cap && cap < max_cap) ensure_cap(pool);
+
+    const i32 i = lb(px);
+    if (i < n && a[i].px == px) {
+      if (q == qty_type{0}) {
+        if (i + 1 < n)
+          std::memmove(&a[i], &a[i + 1], (size_t)(n - i - 1) * sizeof(level_type));
+        --n;
       } else {
-        for (i32 i = 0; i < n; ++i) {
-          if (!(a[i].px <= th)) {
-            if (w != i) a[w] = a[i];
-            ++w;
-          }
-        }
+        a[i].qty = q;
       }
-      n = w;
+      return;
     }
 
-    template <bool IsBid, class Fn>
-    TB_ALWAYS_INLINE void iterate(Fn&& fn, price_type worst_px) const noexcept {
+    if (q == qty_type{0}) return;
+
+    if (n == cap) {
       if constexpr (IsBid) {
-        for (i32 i = n - 1; i >= 0; --i) {
-          const auto& lv = a[i];
-          if (lv.px < worst_px) break;
-          if (!fn(lv.px, lv.qty)) return;
-        }
+        if (px <= a[0].px) return;
+        if (n > 1)
+          std::memmove(&a[0], &a[1], (size_t)(n - 1) * sizeof(level_type));
+        --n;
       } else {
-        for (i32 i = 0; i < n; ++i) {
-          const auto& lv = a[i];
-          if (lv.px > worst_px) break;
-          if (!fn(lv.px, lv.qty)) return;
-        }
+        if (px >= a[n - 1].px) return;
+        --n;
       }
     }
 
-    template <bool IsBid>
-    [[nodiscard]] constexpr TB_ALWAYS_INLINE price_type best_px() const noexcept {
-      if (n == 0) return IsBid ? lowest_px<price_type>() : highest_px<price_type>();
-      return IsBid ? a[n - 1].px : a[0].px;
+    const i32 j = lb(px);
+    if (j < n)
+      std::memmove(&a[j + 1], &a[j], (size_t)(n - j) * sizeof(level_type));
+    a[j] = level_type{px, q};
+    ++n;
+  }
+
+  template <class Sink>
+  TB_ALWAYS_INLINE void drain_range(price_type lo_px, price_type hi_px, Sink&& sink) noexcept {
+    if (n == 0) return;
+    const i32 L = lb(lo_px);
+    i32 R = L;
+    while (R < n && a[R].px <= hi_px) {
+      if (a[R].qty) sink(a[R].px, a[R].qty);
+      ++R;
     }
-
-    template <bool IsBid>
-    [[nodiscard]] constexpr TB_ALWAYS_INLINE qty_type best_qty() const noexcept {
-      if (n == 0) return qty_type{0};
-      return IsBid ? a[n - 1].qty : a[0].qty;
+    if (L < R) {
+      const i32 keepR = n - R;
+      if (keepR > 0)
+        std::memmove(&a[L], &a[R], (size_t)keepR * sizeof(level_type));
+      n = L + keepR;
     }
+  }
 
-    constexpr TB_ALWAYS_INLINE void clear() noexcept { n = 0; }
-  };
+  template <bool IsBid>
+  TB_ALWAYS_INLINE void erase_better(price_type th) noexcept {
+    if (n == 0) return;
+    i32 w = 0;
+    if constexpr (IsBid) {
+      for (i32 i = 0; i < n; ++i) {
+        if (!(a[i].px >= th)) {
+          if (w != i) a[w] = a[i];
+          ++w;
+        }
+      }
+    } else {
+      for (i32 i = 0; i < n; ++i) {
+        if (!(a[i].px <= th)) {
+          if (w != i) a[w] = a[i];
+          ++w;
+        }
+      }
+    }
+    n = w;
+  }
 
-  SideFlat bid, ask;
+  template <bool IsBid, class Fn>
+  TB_ALWAYS_INLINE void iterate(Fn&& fn, price_type worst_px) const noexcept {
+    if constexpr (IsBid) {
+      for (i32 i = n - 1; i >= 0; --i) {
+        const auto& lv = a[i];
+        if (lv.px < worst_px) break;
+        if (!fn(lv.px, lv.qty)) return;
+      }
+    } else {
+      for (i32 i = 0; i < n; ++i) {
+        const auto& lv = a[i];
+        if (lv.px > worst_px) break;
+        if (!fn(lv.px, lv.qty)) return;
+      }
+    }
+  }
+
+  template <bool IsBid>
+  [[nodiscard]] constexpr TB_ALWAYS_INLINE price_type best_px() const noexcept {
+    if (n == 0) return IsBid ? lowest_px<price_type>() : highest_px<price_type>();
+    return IsBid ? a[n - 1].px : a[0].px;
+  }
+
+  template <bool IsBid>
+  [[nodiscard]] constexpr TB_ALWAYS_INLINE qty_type best_qty() const noexcept {
+    if (n == 0) return qty_type{0};
+    return IsBid ? a[n - 1].qty : a[0].qty;
+  }
+
+  constexpr TB_ALWAYS_INLINE void clear() noexcept { n = 0; }
+
+  TB_ALWAYS_INLINE void release(pool_type* pool) noexcept {
+    if (pool) pool->deallocate(a, cap);
+    else      std::free(a);
+    a = nullptr;
+    n = 0;
+    cap = 0;
+  }
+
+};
+
+// DynSpillBuffer wraps two SideDynamic instances (bid + ask).
+// Satisfies the Sink concept used by Tape.
+// When pool_ is non-null, alloc/dealloc routes through SpillPool.
+// When pool_ is null (default), uses malloc/free.
+template <typename PriceT, typename QtyT>
+struct DynSpillBuffer {
+  using price_type = PriceT;
+  using qty_type   = QtyT;
+  using pool_type  = SpillPool<PriceT, QtyT>;
+
+  SideDynamic<PriceT, QtyT> bid;
+  SideDynamic<PriceT, QtyT> ask;
+  pool_type* pool_{nullptr};
+
+  explicit DynSpillBuffer(i32 max_cap = 4096, pool_type* pool = nullptr) noexcept
+      : bid(max_cap), ask(max_cap), pool_(pool) {
+    assert(max_cap >= 1);
+    assert((max_cap & (max_cap - 1)) == 0 && "max_cap must be a power of 2");
+  }
+
+  ~DynSpillBuffer() {
+    bid.release(pool_);
+    ask.release(pool_);
+  }
+
+  DynSpillBuffer(const DynSpillBuffer&) = delete;
+  DynSpillBuffer& operator=(const DynSpillBuffer&) = delete;
+
+  DynSpillBuffer(DynSpillBuffer&& o) noexcept
+      : bid(o.bid.max_cap), ask(o.ask.max_cap), pool_(o.pool_) {
+    bid.a = o.bid.a; bid.n = o.bid.n; bid.cap = o.bid.cap;
+    ask.a = o.ask.a; ask.n = o.ask.n; ask.cap = o.ask.cap;
+    o.bid.a = nullptr; o.bid.n = 0; o.bid.cap = 0;
+    o.ask.a = nullptr; o.ask.n = 0; o.ask.cap = 0;
+  }
+
+  DynSpillBuffer& operator=(DynSpillBuffer&& o) noexcept {
+    if (this != &o) {
+      bid.release(pool_);
+      ask.release(pool_);
+      pool_ = o.pool_;
+      bid.max_cap = o.bid.max_cap;
+      bid.a = o.bid.a; bid.n = o.bid.n; bid.cap = o.bid.cap;
+      ask.max_cap = o.ask.max_cap;
+      ask.a = o.ask.a; ask.n = o.ask.n; ask.cap = o.ask.cap;
+      o.bid.a = nullptr; o.bid.n = 0; o.bid.cap = 0;
+      o.ask.a = nullptr; o.ask.n = 0; o.ask.cap = 0;
+    }
+    return *this;
+  }
 
   constexpr TB_ALWAYS_INLINE void clear() noexcept {
     bid.clear();
     ask.clear();
   }
 
+  TB_ALWAYS_INLINE void release() noexcept {
+    bid.release(pool_);
+    ask.release(pool_);
+  }
+
   template <bool IsBid>
   TB_ALWAYS_INLINE void push(price_type px, qty_type q) noexcept {
-    if constexpr (IsBid) bid.template add_point<true>(px, q);
-    else                 ask.template add_point<false>(px, q);
+    if constexpr (IsBid) bid.template add_point<true>(px, q, pool_);
+    else                 ask.template add_point<false>(px, q, pool_);
   }
 
   template <bool IsBid, class Fn>
@@ -232,10 +336,116 @@ struct SpillBuffer {
   }
 };
 
-struct NullSink {
-  template <bool IsBid>
-  TB_ALWAYS_INLINE void push(auto, auto) noexcept {}
-  TB_ALWAYS_INLINE void clear() noexcept {}
+}  // namespace tape_book
+
+#include <cstdlib>
+#include <cstring>
+#include <cassert>
+
+namespace tape_book {
+
+// SpillPool: arena-based allocator for spill buffer blocks.
+// Uses power-of-2 size-class free lists with intrusive nodes.
+// Single-threaded — no synchronization.
+template <typename PriceT, typename QtyT>
+struct SpillPool {
+  using level_type = LevelT<PriceT, QtyT>;
+
+  static constexpr i32 NUM_CLASSES = 12;   // classes 0..11
+  static constexpr i32 MIN_BLOCK   = 16;   // smallest block = 16 levels
+
+  // Intrusive free-list node, stored in the first bytes of a freed block.
+  // Safe because each block is >= MIN_BLOCK * sizeof(level_type) bytes.
+  struct FreeNode { i32 next_offset; };  // offset into arena, -1 = end
+
+  level_type* arena;
+  i32 arena_cap;                          // total capacity in levels
+  i32 watermark{0};                       // bump-allocator high-water mark
+  i32 free_heads[NUM_CLASSES];            // per-class free list heads (-1 = empty)
+  i32 alloc_fail_count{0};               // diagnostic: incremented on pool exhaustion
+
+  explicit SpillPool(i32 total_cap) noexcept : arena_cap(total_cap) {
+    assert(total_cap >= MIN_BLOCK);
+    arena = static_cast<level_type*>(
+        std::malloc(static_cast<size_t>(total_cap) * sizeof(level_type)));
+    assert(arena && "SpillPool arena allocation failed");
+    for (i32 i = 0; i < NUM_CLASSES; ++i) free_heads[i] = -1;
+  }
+
+  ~SpillPool() { std::free(arena); }
+
+  SpillPool(const SpillPool&) = delete;
+  SpillPool& operator=(const SpillPool&) = delete;
+  SpillPool(SpillPool&&) = delete;
+  SpillPool& operator=(SpillPool&&) = delete;
+
+  // Map a requested capacity to a size-class index [0, NUM_CLASSES).
+  [[nodiscard]] static TB_ALWAYS_INLINE i32 size_class(i32 cap) noexcept {
+    if (cap <= MIN_BLOCK) return 0;
+    // ceil(log2(cap)) - log2(MIN_BLOCK)
+    int bits = 32 - __builtin_clz(static_cast<unsigned>(cap - 1));
+    int cls = bits - 4;  // MIN_BLOCK = 16 = 2^4
+    if (cls < 0) cls = 0;
+    if (cls >= NUM_CLASSES) cls = NUM_CLASSES - 1;
+    return cls;
+  }
+
+  // Actual block size (in levels) for a given class index.
+  [[nodiscard]] static constexpr TB_ALWAYS_INLINE i32 class_size(i32 cls) noexcept {
+    return MIN_BLOCK << cls;
+  }
+
+  // Allocate a block of at least `cap` levels. O(1).
+  // Returns nullptr on pool exhaustion (increments alloc_fail_count).
+  [[nodiscard]] TB_ALWAYS_INLINE level_type* allocate(i32 cap) noexcept {
+    const i32 cls = size_class(cap);
+    const i32 actual = class_size(cls);
+
+    // Try free list first
+    if (free_heads[cls] != -1) {
+      const i32 off = free_heads[cls];
+      auto* node = reinterpret_cast<FreeNode*>(arena + off);
+      free_heads[cls] = node->next_offset;
+      return arena + off;
+    }
+
+    // Bump allocate
+    if (watermark + actual <= arena_cap) {
+      level_type* ptr = arena + watermark;
+      watermark += actual;
+      return ptr;
+    }
+
+    // Exhausted
+    ++alloc_fail_count;
+    return nullptr;
+  }
+
+  // Return a block to the pool. nullptr is a no-op.
+  TB_ALWAYS_INLINE void deallocate(level_type* ptr, i32 cap) noexcept {
+    if (!ptr) return;
+    const i32 cls = size_class(cap);
+    const i32 off = static_cast<i32>(ptr - arena);
+    auto* node = reinterpret_cast<FreeNode*>(ptr);
+    node->next_offset = free_heads[cls];
+    free_heads[cls] = off;
+  }
+
+  // Grow a block: allocate new, memcpy used entries, deallocate old.
+  // If old==nullptr, just allocates (no memcpy/free).
+  [[nodiscard]] TB_ALWAYS_INLINE level_type* reallocate(
+      level_type* old, i32 old_cap, i32 new_cap, i32 used) noexcept {
+    auto* p = allocate(new_cap);
+    if (!p) return nullptr;
+    if (old) {
+      std::memcpy(p, old, static_cast<size_t>(used) * sizeof(level_type));
+      deallocate(old, old_cap);
+    }
+    return p;
+  }
+
+  [[nodiscard]] i32 used_levels() const noexcept { return watermark; }
+  [[nodiscard]] i32 total_levels() const noexcept { return arena_cap; }
 };
 
 }  // namespace tape_book
@@ -262,14 +472,6 @@ class Tape {
   static constexpr i64 N64 = static_cast<i64>(N);
   static constexpr i32 N32 = static_cast<i32>(N);
 
-  [[nodiscard]] static constexpr PriceT min_valid_anchor() noexcept {
-    return std::numeric_limits<PriceT>::lowest() + (N - 1);
-  }
-
-  [[nodiscard]] static constexpr PriceT max_valid_anchor() noexcept {
-    return std::numeric_limits<PriceT>::max() - (N - 1);
-  }
-
   [[nodiscard]] static constexpr u64 safe_abs(i64 d) noexcept {
     return (d == std::numeric_limits<i64>::min())
       ? static_cast<u64>(std::numeric_limits<i64>::max()) + 1u
@@ -277,12 +479,16 @@ class Tape {
   }
 
  public:
-  static constexpr i32 size() noexcept { return N32; }
+  [[nodiscard]] static constexpr PriceT min_valid_anchor() noexcept {
+    return std::numeric_limits<PriceT>::lowest() + (N - 1);
+  }
 
+  [[nodiscard]] static constexpr PriceT max_valid_anchor() noexcept {
+    return std::numeric_limits<PriceT>::max() - (N - 1);
+  }
   TB_ALWAYS_INLINE void reset(PriceT anchor) noexcept {
-#ifndef NDEBUG
     assert(anchor >= min_valid_anchor() && anchor <= max_valid_anchor());
-#endif
+    TB_ASSUME(anchor >= min_valid_anchor() && anchor <= max_valid_anchor());
     std::memset(qty,  0, sizeof(qty));
     std::memset(bits, 0, sizeof(bits));
     anchor_px = anchor;
@@ -333,26 +539,6 @@ class Tape {
     return scan == best_idx;
   }
 
-  [[nodiscard]] TB_ALWAYS_INLINE i32 headroom_dn(i32 H = 0) const noexcept {
-    if constexpr (IsBid) {
-      if (best_idx < 0) return N32;
-      i32 m = (N32 - 1 - best_idx) - H;
-      return m > 0 ? m : 0;
-    } else {
-      return 0;
-    }
-  }
-
-  [[nodiscard]] TB_ALWAYS_INLINE i32 headroom_up(i32 H = 0) const noexcept {
-    if constexpr (IsBid) {
-      return 0;
-    } else {
-      if (best_idx >= N32) return N32;
-      i32 m = best_idx - H;
-      return m > 0 ? m : 0;
-    }
-  }
-
   template <class Sink>
   [[nodiscard]] TB_ALWAYS_INLINE UpdateResult set_qty(PriceT px, QtyT q, Sink&& sink) noexcept {
     i32 i = idx_from_price(px);
@@ -374,7 +560,7 @@ class Tape {
     }
 
     QtyT& cell = qty[i];
-    if (q == QtyT{0} && cell == QtyT{0}) return UpdateResult::Update;
+    if (q == QtyT{0} && cell == QtyT{0}) return UpdateResult::Erase;
 
     i32 w = i >> 6;
     u64 m = 1ULL << (i & 63);
@@ -401,9 +587,8 @@ class Tape {
 
   template <class Sink>
   TB_ALWAYS_INLINE void recenter_to_anchor(PriceT new_anchor, Sink&& sink) noexcept {
-#ifndef NDEBUG
     assert(new_anchor >= min_valid_anchor() && new_anchor <= max_valid_anchor());
-#endif
+    TB_ASSUME(new_anchor >= min_valid_anchor() && new_anchor <= max_valid_anchor());
     const i64 d = static_cast<i64>(new_anchor) - static_cast<i64>(anchor_px);
     if (d == 0) return;
 
@@ -503,9 +688,7 @@ class Tape {
     i32 wl = L >> 6, wr = R >> 6;
 
     u64 left_mask  = ~0ULL << (L & 63);
-    u64 right_mask = (wr == wl)
-                         ? ((R & 63) == 63 ? ~0ULL : ((1ULL << (u32)((R & 63) + 1)) - 1ULL))
-                         : ~0ULL;
+    u64 right_mask = (R & 63) == 63 ? ~0ULL : ((1ULL << (u32)((R & 63) + 1)) - 1ULL);
 
     for (i32 w = wl; w <= wr; ++w) {
       u64 word = bits[(size_t)w];
@@ -596,30 +779,37 @@ class Tape {
 
 namespace tape_book {
 
-template <i32 N, class SpillBuf>
+template <i32 N, typename PriceT, typename QtyT>
 struct TapeBook {
-  using price_type = typename SpillBuf::price_type;
-  using qty_type   = typename SpillBuf::qty_type;
+  using price_type = PriceT;
+  using qty_type   = QtyT;
 
   static constexpr i32 N32 = static_cast<i32>(N);
   static constexpr i64 N64 = static_cast<i64>(N);
 
   [[nodiscard]] static constexpr price_type compute_anchor(price_type px, i64 offset) noexcept {
     constexpr auto min_px = std::numeric_limits<price_type>::lowest();
-    constexpr auto min_anchor = min_px + (N64 - 1);
-    return (px < min_px + offset) ? min_anchor : px - offset;
+    constexpr auto max_px = std::numeric_limits<price_type>::max();
+    constexpr auto min_anchor = static_cast<price_type>(min_px + (N64 - 1));
+    constexpr auto max_anchor = static_cast<price_type>(max_px - (N64 - 1));
+    if (px < min_px + offset) return min_anchor;
+    // px - offset is computed in i64 due to offset being i64
+    i64 result = static_cast<i64>(px) - offset;
+    return (result > max_anchor) ? max_anchor : static_cast<price_type>(result);
   }
 
   Tape<N, true,  price_type, qty_type> bids;
   Tape<N, false, price_type, qty_type> asks;
-  SpillBuf& spill_buffer;
+  DynSpillBuffer<price_type, qty_type> spill;
 
-  explicit TapeBook(SpillBuf& sb) : spill_buffer(sb) {}
+  explicit TapeBook(i32 max_cap = 4096,
+                    SpillPool<price_type, qty_type>* pool = nullptr) noexcept
+      : spill(max_cap, pool) {}
 
   TB_ALWAYS_INLINE void reset(price_type anchor) noexcept {
     bids.reset(anchor);
     asks.reset(anchor);
-    spill_buffer.clear();
+    spill.clear();
   }
 
   template <bool IsBid>
@@ -631,66 +821,58 @@ struct TapeBook {
 
   [[nodiscard]] TB_ALWAYS_INLINE price_type best_bid_px() const noexcept {
     const auto tape_best = bids.best_px();
-    const auto spill_best = spill_buffer.template best_px<true>();
+    const auto spill_best = spill.template best_px<true>();
     return (tape_best > spill_best) ? tape_best : spill_best;
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE price_type best_ask_px() const noexcept {
     const auto tape_best = asks.best_px();
-    const auto spill_best = spill_buffer.template best_px<false>();
+    const auto spill_best = spill.template best_px<false>();
     return (tape_best < spill_best) ? tape_best : spill_best;
-  }
-
-  template <bool IsBid>
-  [[nodiscard]] TB_ALWAYS_INLINE price_type best_px() const noexcept {
-    if constexpr (IsBid) return bids.best_px();
-    else                 return asks.best_px();
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE qty_type best_bid_qty() const noexcept {
     const auto tape_best  = bids.best_px();
-    const auto spill_best = spill_buffer.template best_px<true>();
-    return (tape_best > spill_best)
+    const auto spill_best = spill.template best_px<true>();
+    return (tape_best >= spill_best)
            ? bids.best_qty()
-           : spill_buffer.template best_qty<true>();
+           : spill.template best_qty<true>();
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE qty_type best_ask_qty() const noexcept {
     const auto tape_best  = asks.best_px();
-    const auto spill_best = spill_buffer.template best_px<false>();
-    return (tape_best < spill_best)
+    const auto spill_best = spill.template best_px<false>();
+    return (tape_best <= spill_best)
            ? asks.best_qty()
-           : spill_buffer.template best_qty<false>();
+           : spill.template best_qty<false>();
   }
-
-  [[nodiscard]] TB_ALWAYS_INLINE i32 bid_headroom_dn(i32 H = 0) const noexcept { return bids.headroom_dn(H); }
-  [[nodiscard]] TB_ALWAYS_INLINE i32 ask_headroom_up(i32 H = 0) const noexcept { return asks.headroom_up(H); }
 
   template <bool IsBid>
   TB_ALWAYS_INLINE void erase_better(price_type px) noexcept {
-    if constexpr (IsBid) bids.erase_better(px, spill_buffer);
-    else                 asks.erase_better(px, spill_buffer);
+    if constexpr (IsBid) bids.erase_better(px, spill);
+    else                 asks.erase_better(px, spill);
   }
 
   template <bool IsBid, typename TapeT>
   [[nodiscard]] TB_ALWAYS_INLINE UpdateResult
   set_impl(TapeT& tape, price_type px, qty_type q) noexcept {
-    auto rc = tape.set_qty(px, q, spill_buffer);
+    auto rc = tape.set_qty(px, q, spill);
     if (TB_LIKELY(rc != UpdateResult::Promote)) return rc;
 
     price_type A = compute_anchor(px, N64 / 2);
     const price_type minA = compute_anchor(px, N64 - 1);
     if (A < minA) A = minA;
     if (A > px)   A = px;
+    TB_ASSUME(A >= TapeT::min_valid_anchor() && A <= TapeT::max_valid_anchor());
 
-    tape.recenter_to_anchor(A, spill_buffer);
+    tape.recenter_to_anchor(A, spill);
 
     const price_type lo = tape.anchor();
     const price_type hi =
         static_cast<price_type>(static_cast<i64>(lo) + N32 - 1);
 
     NullSink nospill;
-    spill_buffer.template drain<IsBid>(lo, hi, [&](price_type p, qty_type qq) {
+    spill.template drain<IsBid>(lo, hi, [&](price_type p, qty_type qq) {
       (void)tape.set_qty(p, qq, nospill);
     });
 
@@ -710,27 +892,23 @@ struct TapeBook {
   }
 
   TB_ALWAYS_INLINE void recenter_bid(price_type new_anchor) noexcept {
-    bids.recenter_to_anchor(new_anchor, spill_buffer);
+    bids.recenter_to_anchor(new_anchor, spill);
     const price_type lo = bids.anchor();
     const price_type hi = static_cast<price_type>(static_cast<i64>(lo) + N32 - 1);
     NullSink nospill;
-    spill_buffer.template drain<true>(lo, hi, [&](price_type px, qty_type q) {
+    spill.template drain<true>(lo, hi, [&](price_type px, qty_type q) {
       (void)bids.set_qty(px, q, nospill);
     });
   }
 
   TB_ALWAYS_INLINE void recenter_ask(price_type new_anchor) noexcept {
-    asks.recenter_to_anchor(new_anchor, spill_buffer);
+    asks.recenter_to_anchor(new_anchor, spill);
     const price_type lo = asks.anchor();
     const price_type hi = static_cast<price_type>(static_cast<i64>(lo) + N32 - 1);
     NullSink nospill;
-    spill_buffer.template drain<false>(lo, hi, [&](price_type px, qty_type q) {
+    spill.template drain<false>(lo, hi, [&](price_type px, qty_type q) {
       (void)asks.set_qty(px, q, nospill);
     });
-  }
-
-  [[nodiscard]] TB_ALWAYS_INLINE bool anchors_equal() const noexcept {
-    return bids.anchor() == asks.anchor();
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE bool crossed_on_tape() const noexcept {
@@ -743,19 +921,24 @@ struct TapeBook {
 };
 
 template <i32 N,
-          i32 CAP,
           typename PriceT,
           typename QtyT>
 struct Book {
   using price_type = PriceT;
   using qty_type   = QtyT;
-  using Spill      = SpillBuffer<CAP, PriceT, QtyT>;
-  using Core       = TapeBook<N, Spill>;
+  using Core       = TapeBook<N, PriceT, QtyT>;
 
-  Spill spill;
-  Core  core;
+  Core core;
 
-  Book() : spill(), core(spill) {}
+  explicit Book(i32 max_cap = 4096,
+                SpillPool<price_type, qty_type>* pool = nullptr) noexcept
+      : core(max_cap, pool) {}
+
+  Book(const Book&) = delete;
+  Book& operator=(const Book&) = delete;
+
+  Book(Book&&) noexcept = default;
+  Book& operator=(Book&&) noexcept = default;
 
   TB_ALWAYS_INLINE void reset(price_type anchor_px) noexcept { core.reset(anchor_px); }
 
@@ -811,6 +994,7 @@ struct Book {
 }  // namespace tape_book
 
 #include <vector>
+#include <memory>
 #include <cstdint>
 #include <cassert>
 
@@ -825,53 +1009,67 @@ enum class BookTier : std::uint8_t {
 template <
     typename PriceT,
     typename QtyT,
-    i32 N_HIGH,   i32 CAP_HIGH,
-    i32 N_MEDIUM, i32 CAP_MEDIUM,
-    i32 N_LOW,    i32 CAP_LOW,
-    class HighAlloc   = std::allocator<Book<N_HIGH,   CAP_HIGH,   PriceT, QtyT>>,
-    class MediumAlloc = std::allocator<Book<N_MEDIUM, CAP_MEDIUM, PriceT, QtyT>>,
-    class LowAlloc    = std::allocator<Book<N_LOW,    CAP_LOW,    PriceT, QtyT>>>
+    i32 N_HIGH,
+    i32 N_MEDIUM,
+    i32 N_LOW,
+    class HighAlloc   = std::allocator<Book<N_HIGH,   PriceT, QtyT>>,
+    class MediumAlloc = std::allocator<Book<N_MEDIUM, PriceT, QtyT>>,
+    class LowAlloc    = std::allocator<Book<N_LOW,    PriceT, QtyT>>>
 struct MultiBookPool3 {
   using price_type = PriceT;
   using qty_type   = QtyT;
 
-  using HighBook   = Book<N_HIGH,   CAP_HIGH,   price_type, qty_type>;
-  using MediumBook = Book<N_MEDIUM, CAP_MEDIUM, price_type, qty_type>;
-  using LowBook    = Book<N_LOW,    CAP_LOW,    price_type, qty_type>;
+  using HighBook   = Book<N_HIGH,   price_type, qty_type>;
+  using MediumBook = Book<N_MEDIUM, price_type, qty_type>;
+  using LowBook    = Book<N_LOW,    price_type, qty_type>;
 
   struct Handle {
     BookTier       tier;
     std::uint32_t  idx;
   };
 
+  using pool_type = SpillPool<price_type, qty_type>;
+
+  // pool_ declared BEFORE book vectors — destruction is reverse order,
+  // so books are destroyed before the pool they reference.
+  std::unique_ptr<pool_type> pool_;
+
   std::vector<HighBook,   HighAlloc>   high_;
   std::vector<MediumBook, MediumAlloc> medium_;
   std::vector<LowBook,    LowAlloc>    low_;
 
-  constexpr MultiBookPool3() = default;
+  i32 default_max_cap_{4096};
+
+  MultiBookPool3() = default;
+  explicit MultiBookPool3(i32 max_cap, i32 pool_cap = 0) noexcept
+      : pool_(pool_cap > 0 ? new pool_type(pool_cap) : nullptr),
+        default_max_cap_(max_cap) {}
 
   TB_ALWAYS_INLINE void reserve_high(std::size_t n)   { high_.reserve(n); }
   TB_ALWAYS_INLINE void reserve_medium(std::size_t n) { medium_.reserve(n); }
   TB_ALWAYS_INLINE void reserve_low(std::size_t n)    { low_.reserve(n); }
 
   [[nodiscard]] TB_ALWAYS_INLINE Handle alloc(BookTier tier,
-                                               price_type anchor_px = price_type{0}) {
+                                               price_type anchor_px = price_type{0},
+                                               i32 max_cap = 0) {
+    if (max_cap == 0) max_cap = default_max_cap_;
+    auto* p = pool_.get();
     switch (tier) {
       case BookTier::High: {
         const std::uint32_t idx = static_cast<std::uint32_t>(high_.size());
-        high_.emplace_back();
+        high_.emplace_back(max_cap, p);
         high_.back().reset(anchor_px);
         return Handle{BookTier::High, idx};
       }
       case BookTier::Medium: {
         const std::uint32_t idx = static_cast<std::uint32_t>(medium_.size());
-        medium_.emplace_back();
+        medium_.emplace_back(max_cap, p);
         medium_.back().reset(anchor_px);
         return Handle{BookTier::Medium, idx};
       }
       case BookTier::Low: {
         const std::uint32_t idx = static_cast<std::uint32_t>(low_.size());
-        low_.emplace_back();
+        low_.emplace_back(max_cap, p);
         low_.back().reset(anchor_px);
         return Handle{BookTier::Low, idx};
       }
@@ -923,7 +1121,7 @@ struct MultiBookPool3 {
 
 namespace tape_book {
 
-using Book32 = Book<1024, 4096, i32, u32>;
-using Book64 = Book<1024, 4096, i64, u64>;
+using Book32 = Book<1024, i32, u32>;
+using Book64 = Book<1024, i64, u64>;
 
 }  // namespace tape_book

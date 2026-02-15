@@ -23,14 +23,6 @@ class Tape {
   static constexpr i64 N64 = static_cast<i64>(N);
   static constexpr i32 N32 = static_cast<i32>(N);
 
-  [[nodiscard]] static constexpr PriceT min_valid_anchor() noexcept {
-    return std::numeric_limits<PriceT>::lowest() + (N - 1);
-  }
-
-  [[nodiscard]] static constexpr PriceT max_valid_anchor() noexcept {
-    return std::numeric_limits<PriceT>::max() - (N - 1);
-  }
-
   [[nodiscard]] static constexpr u64 safe_abs(i64 d) noexcept {
     return (d == std::numeric_limits<i64>::min())
       ? static_cast<u64>(std::numeric_limits<i64>::max()) + 1u
@@ -38,12 +30,16 @@ class Tape {
   }
 
  public:
-  static constexpr i32 size() noexcept { return N32; }
+  [[nodiscard]] static constexpr PriceT min_valid_anchor() noexcept {
+    return std::numeric_limits<PriceT>::lowest() + (N - 1);
+  }
 
+  [[nodiscard]] static constexpr PriceT max_valid_anchor() noexcept {
+    return std::numeric_limits<PriceT>::max() - (N - 1);
+  }
   TB_ALWAYS_INLINE void reset(PriceT anchor) noexcept {
-#ifndef NDEBUG
     assert(anchor >= min_valid_anchor() && anchor <= max_valid_anchor());
-#endif
+    TB_ASSUME(anchor >= min_valid_anchor() && anchor <= max_valid_anchor());
     std::memset(qty,  0, sizeof(qty));
     std::memset(bits, 0, sizeof(bits));
     anchor_px = anchor;
@@ -94,26 +90,6 @@ class Tape {
     return scan == best_idx;
   }
 
-  [[nodiscard]] TB_ALWAYS_INLINE i32 headroom_dn(i32 H = 0) const noexcept {
-    if constexpr (IsBid) {
-      if (best_idx < 0) return N32;
-      i32 m = (N32 - 1 - best_idx) - H;
-      return m > 0 ? m : 0;
-    } else {
-      return 0;
-    }
-  }
-
-  [[nodiscard]] TB_ALWAYS_INLINE i32 headroom_up(i32 H = 0) const noexcept {
-    if constexpr (IsBid) {
-      return 0;
-    } else {
-      if (best_idx >= N32) return N32;
-      i32 m = best_idx - H;
-      return m > 0 ? m : 0;
-    }
-  }
-
   template <class Sink>
   [[nodiscard]] TB_ALWAYS_INLINE UpdateResult set_qty(PriceT px, QtyT q, Sink&& sink) noexcept {
     i32 i = idx_from_price(px);
@@ -135,7 +111,7 @@ class Tape {
     }
 
     QtyT& cell = qty[i];
-    if (q == QtyT{0} && cell == QtyT{0}) return UpdateResult::Update;
+    if (q == QtyT{0} && cell == QtyT{0}) return UpdateResult::Erase;
 
     i32 w = i >> 6;
     u64 m = 1ULL << (i & 63);
@@ -162,9 +138,8 @@ class Tape {
 
   template <class Sink>
   TB_ALWAYS_INLINE void recenter_to_anchor(PriceT new_anchor, Sink&& sink) noexcept {
-#ifndef NDEBUG
     assert(new_anchor >= min_valid_anchor() && new_anchor <= max_valid_anchor());
-#endif
+    TB_ASSUME(new_anchor >= min_valid_anchor() && new_anchor <= max_valid_anchor());
     const i64 d = static_cast<i64>(new_anchor) - static_cast<i64>(anchor_px);
     if (d == 0) return;
 
@@ -264,9 +239,7 @@ class Tape {
     i32 wl = L >> 6, wr = R >> 6;
 
     u64 left_mask  = ~0ULL << (L & 63);
-    u64 right_mask = (wr == wl)
-                         ? ((R & 63) == 63 ? ~0ULL : ((1ULL << (u32)((R & 63) + 1)) - 1ULL))
-                         : ~0ULL;
+    u64 right_mask = (R & 63) == 63 ? ~0ULL : ((1ULL << (u32)((R & 63) + 1)) - 1ULL);
 
     for (i32 w = wl; w <= wr; ++w) {
       u64 word = bits[(size_t)w];
