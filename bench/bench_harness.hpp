@@ -49,6 +49,7 @@ struct LatencyStats {
     int64_t min   = 0;
     int64_t max   = 0;
     int64_t mean  = 0;
+    int64_t p25   = 0;
     int64_t p50   = 0;
     int64_t p90   = 0;
     int64_t p99   = 0;
@@ -83,6 +84,7 @@ struct LatencyCollector {
             .min   = samples.front(),
             .max   = samples.back(),
             .mean  = sum / static_cast<int64_t>(samples.size()),
+            .p25   = pct(0.25),
             .p50   = pct(0.50),
             .p90   = pct(0.90),
             .p99   = pct(0.99),
@@ -290,11 +292,11 @@ inline void print_header(const char* workload_name, int ops) {
 
 inline void print_table_header() {
     std::fprintf(stdout,
-        "  %-26s | %5s | %5s | %5s | %5s | %5s | %7s | %5s | %7s\n",
-        "Implementation", "min", "p50", "p90", "p99", "p99.9", "max", "mean", "Mops/s");
+        "  %-26s | %5s | %5s | %5s | %5s | %5s | %5s | %7s | %5s | %7s\n",
+        "Implementation", "min", "p25", "p50", "p90", "p99", "p99.9", "max", "mean", "Mops/s");
     std::fprintf(stdout,
-        "  %-26s-+-%5s-+-%5s-+-%5s-+-%5s-+-%5s-+-%7s-+-%5s-+-%7s\n",
-        "--------------------------", "-----", "-----", "-----",
+        "  %-26s-+-%5s-+-%5s-+-%5s-+-%5s-+-%5s-+-%5s-+-%7s-+-%5s-+-%7s\n",
+        "--------------------------", "-----", "-----", "-----", "-----",
         "-----", "-----", "-------", "-----", "-------");
 }
 
@@ -302,9 +304,9 @@ inline void print_row(const BenchResult& r) {
     const auto& s = r.set_stats;
     double mops = (s.mean > 0) ? 1000.0 / static_cast<double>(s.mean) : 0.0;
     std::fprintf(stdout,
-        "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld | %7.1f\n",
+        "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld | %7.1f\n",
         r.name,
-        (long long)s.min, (long long)s.p50, (long long)s.p90,
+        (long long)s.min, (long long)s.p25, (long long)s.p50, (long long)s.p90,
         (long long)s.p99, (long long)s.p999, (long long)s.max,
         (long long)s.mean, mops);
 }
@@ -318,9 +320,9 @@ inline void print_query_row(const BenchResult& r) {
     const auto& s = r.query_stats;
     double mops = (s.mean > 0) ? 1000.0 / static_cast<double>(s.mean) : 0.0;
     std::fprintf(stdout,
-        "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld | %7.1f\n",
+        "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld | %7.1f\n",
         r.name,
-        (long long)s.min, (long long)s.p50, (long long)s.p90,
+        (long long)s.min, (long long)s.p25, (long long)s.p50, (long long)s.p90,
         (long long)s.p99, (long long)s.p999, (long long)s.max,
         (long long)s.mean, mops);
 }

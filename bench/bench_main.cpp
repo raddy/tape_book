@@ -319,6 +319,295 @@ void run_mixed_suite(const char* name, MakeWorkload make_wl) {
 }
 
 // ---------------------------------------------------------------------------
+// bench_book_shift -- thin whippy market: whole book shifts N ticks
+//
+// Models CSI500/Nifty style: bid/ask levels shift by `shift` ticks.
+// Each "shift" = cancel `depth` old levels + set `depth` new levels.
+// Times the full batch of 2*depth operations per shift.
+// ---------------------------------------------------------------------------
+template <typename BookT>
+void bench_book_shift_impl(
+    BookT& book, PriceT anchor,
+    int depth, int shifts, int shift_step,
+    bench::LatencyCollector& collector)
+{
+    std::mt19937_64 rng(SEED);
+
+    // Set up initial book state: `depth` bid levels below anchor,
+    // `depth` ask levels above anchor
+    auto setup_book = [&](PriceT center) {
+        book.reset(center);
+        for (int d = 0; d < depth; ++d) {
+            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+            book.set_bid(static_cast<PriceT>(center - 1 - d), qty);
+            book.set_ask(static_cast<PriceT>(center + 1 + d), qty);
+        }
+    };
+
+    PriceT center = anchor;
+    setup_book(center);
+
+    bench::Timer timer;
+
+    for (int s = 0; s < shifts; ++s) {
+        PriceT old_center = center;
+        // Shift direction alternates, magnitude = shift_step
+        center = static_cast<PriceT>(
+            static_cast<int64_t>(center) + ((s & 1) ? shift_step : -shift_step));
+
+        bench::ClobberMemory();
+        timer.start();
+
+        // Cancel old levels
+        for (int d = 0; d < depth; ++d) {
+            book.set_bid(static_cast<PriceT>(old_center - 1 - d), QtyT{0});
+            book.set_ask(static_cast<PriceT>(old_center + 1 + d), QtyT{0});
+        }
+        // Set new levels
+        for (int d = 0; d < depth; ++d) {
+            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+            book.set_bid(static_cast<PriceT>(center - 1 - d), qty);
+            book.set_ask(static_cast<PriceT>(center + 1 + d), qty);
+        }
+
+        bench::ClobberMemory();
+        collector.record(timer.elapsed_ns());
+    }
+}
+
+void run_book_shift_bench() {
+    constexpr int DEPTH = 5;       // 5 levels per side (typical L2 depth)
+    constexpr int SHIFTS = 50'000;
+
+    struct ShiftConfig { int step; const char* label; };
+    ShiftConfig configs[] = {
+        {3,  "shift=3 ticks"},
+        {8,  "shift=8 ticks"},
+        {20, "shift=20 ticks"},
+    };
+
+    for (auto& cfg : configs) {
+        std::fprintf(stdout,
+            "\n=== Book Shift: %s, depth=%d, %d shifts ===\n\n",
+            cfg.label, DEPTH, SHIFTS);
+        std::fprintf(stdout,
+            "  %-26s | %5s | %5s | %5s | %5s | %5s | %7s | %7s\n",
+            "Implementation", "p25", "p50", "p90", "p99", "mean", "max", "ns/shift");
+        std::fprintf(stdout,
+            "  %-26s-+-%5s-+-%5s-+-%5s-+-%5s-+-%5s-+-%7s-+-%7s\n",
+            "--------------------------", "-----", "-----", "-----",
+            "-----", "-----", "-------", "-------");
+
+        auto run_one = [&](auto& book, PriceT anchor, const char* name) {
+            bench::LatencyCollector collector;
+            collector.reserve(SHIFTS);
+            bench_book_shift_impl(book, anchor, DEPTH, SHIFTS, cfg.step, collector);
+            auto stats = collector.compute();
+            std::fprintf(stdout,
+                "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %7lld\n",
+                name,
+                (long long)stats.p25, (long long)stats.p50,
+                (long long)stats.p90, (long long)stats.p99,
+                (long long)stats.mean, (long long)stats.max,
+                (long long)stats.mean);
+        };
+
+        char tb_name[48];
+        std::snprintf(tb_name, sizeof(tb_name), "TapeBook<%d>", TAPE_N);
+
+        bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+        bench::OrderBookMap<PriceT, QtyT> obm;
+        bench::OrderBookVector<PriceT, QtyT> obv;
+        bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+
+        run_one(tb,   ANCHOR, tb_name);
+        run_one(obm,  ANCHOR, "OrderBookMap");
+        run_one(obv,  ANCHOR, "OrderBookVector");
+        run_one(obvl, ANCHOR, "OrderBookVectorLinear");
+    }
+    std::fprintf(stdout, "\n");
+}
+
+// ---------------------------------------------------------------------------
+// bench_bbo_improve -- uptick/downtick: how fast is a new best price?
+//
+// Sets up a book with `depth` levels, then repeatedly improves the BBO
+// by setting a new best bid (1 tick better) or new best ask (1 tick better).
+// Times each individual BBO-improving operation.
+// ---------------------------------------------------------------------------
+void run_bbo_improve_bench() {
+    constexpr int DEPTH = 10;
+    constexpr int OPS = 100'000;
+
+    std::fprintf(stdout,
+        "\n=== BBO Improvement (uptick/downtick), %d ops ===\n\n", OPS);
+    std::fprintf(stdout,
+        "  %-26s | %5s | %5s | %5s | %5s | %5s | %7s | %5s\n",
+        "Implementation", "p25", "p50", "p90", "p99", "p99.9", "max", "mean");
+    std::fprintf(stdout,
+        "  %-26s-+-%5s-+-%5s-+-%5s-+-%5s-+-%5s-+-%7s-+-%5s\n",
+        "--------------------------", "-----", "-----", "-----",
+        "-----", "-----", "-------", "-----");
+
+    auto run_one = [&](auto& book, const char* name) {
+        std::mt19937_64 rng(SEED);
+        bench::LatencyCollector collector;
+        collector.reserve(OPS);
+        bench::Timer timer;
+
+        // Start fresh for each run
+        book.reset(ANCHOR);
+
+        // Set up initial depth
+        for (int d = 0; d < DEPTH; ++d) {
+            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+            book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
+            book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
+        }
+
+        PriceT best_bid = static_cast<PriceT>(ANCHOR - 1);
+        PriceT best_ask = static_cast<PriceT>(ANCHOR + 1);
+
+        for (int i = 0; i < OPS; ++i) {
+            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+            bool improve_bid = (i & 1) != 0;
+
+            bench::ClobberMemory();
+            timer.start();
+
+            if (improve_bid) {
+                best_bid = static_cast<PriceT>(best_bid + 1);
+                book.set_bid(best_bid, qty);
+            } else {
+                best_ask = static_cast<PriceT>(best_ask - 1);
+                book.set_ask(best_ask, qty);
+            }
+
+            bench::ClobberMemory();
+            collector.record(timer.elapsed_ns());
+        }
+
+        auto stats = collector.compute();
+        std::fprintf(stdout,
+            "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld\n",
+            name,
+            (long long)stats.p25, (long long)stats.p50,
+            (long long)stats.p90, (long long)stats.p99,
+            (long long)stats.p999, (long long)stats.max,
+            (long long)stats.mean);
+    };
+
+    char tb_name[48];
+    std::snprintf(tb_name, sizeof(tb_name), "TapeBook<%d>", TAPE_N);
+
+    bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+    bench::OrderBookMap<PriceT, QtyT> obm;
+    bench::OrderBookVector<PriceT, QtyT> obv;
+    bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+
+    run_one(tb,   tb_name);
+    run_one(obm,  "OrderBookMap");
+    run_one(obv,  "OrderBookVector");
+    run_one(obvl, "OrderBookVectorLinear");
+
+    std::fprintf(stdout, "\n");
+}
+
+// ---------------------------------------------------------------------------
+// bench_wide_market_midfill -- order joins in the middle of a wide spread
+//
+// Book: bid at ANCHOR-HALF_SPREAD, ask at ANCHOR+HALF_SPREAD (wide market).
+// Repeatedly insert a level somewhere in the mid-spread region, then cancel
+// it. Times the insert (the speed-race-sensitive path).
+// ---------------------------------------------------------------------------
+void run_wide_market_midfill_bench() {
+    constexpr int HALF_SPREAD = 50;   // 100-tick wide market
+    constexpr int OPS = 100'000;
+
+    std::fprintf(stdout,
+        "\n=== Wide Market Mid-Fill (spread=%d, %d ops) ===\n\n",
+        HALF_SPREAD * 2, OPS);
+    std::fprintf(stdout,
+        "  %-26s | %5s | %5s | %5s | %5s | %5s | %7s | %5s\n",
+        "Implementation", "p25", "p50", "p90", "p99", "p99.9", "max", "mean");
+    std::fprintf(stdout,
+        "  %-26s-+-%5s-+-%5s-+-%5s-+-%5s-+-%5s-+-%7s-+-%5s\n",
+        "--------------------------", "-----", "-----", "-----",
+        "-----", "-----", "-------", "-----");
+
+    auto run_one = [&](auto& book, const char* name) {
+        std::mt19937_64 rng(SEED);
+        bench::LatencyCollector collector;
+        collector.reserve(OPS);
+        bench::Timer timer;
+
+        // Set up wide book: bid side has a few levels near ANCHOR-50,
+        // ask side has a few levels near ANCHOR+50
+        book.reset(ANCHOR);
+        for (int d = 0; d < 5; ++d) {
+            book.set_bid(static_cast<PriceT>(ANCHOR - HALF_SPREAD - d),
+                         static_cast<QtyT>(100));
+            book.set_ask(static_cast<PriceT>(ANCHOR + HALF_SPREAD + d),
+                         static_cast<QtyT>(100));
+        }
+
+        // The spread is [ANCHOR-50, ANCHOR+50] -- 100 ticks wide
+        // Now repeatedly insert a bid in the mid-spread (improving the bid
+        // into the "theo" region), time it, then cancel it
+        for (int i = 0; i < OPS; ++i) {
+            // Random price in the mid-spread, closer to current ask
+            // (this is the "someone joins at 20 when market is 5@25" scenario)
+            PriceT mid_px = static_cast<PriceT>(
+                ANCHOR - HALF_SPREAD + 1 +
+                static_cast<int64_t>(rng() % static_cast<uint64_t>(HALF_SPREAD * 2 - 1)));
+            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+            bool is_bid = (i & 1) != 0;
+
+            bench::ClobberMemory();
+            timer.start();
+
+            if (is_bid)
+                book.set_bid(mid_px, qty);
+            else
+                book.set_ask(mid_px, qty);
+
+            bench::ClobberMemory();
+            collector.record(timer.elapsed_ns());
+
+            // Cancel it so the spread stays wide for the next op
+            if (is_bid)
+                book.set_bid(mid_px, QtyT{0});
+            else
+                book.set_ask(mid_px, QtyT{0});
+        }
+
+        auto stats = collector.compute();
+        std::fprintf(stdout,
+            "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld\n",
+            name,
+            (long long)stats.p25, (long long)stats.p50,
+            (long long)stats.p90, (long long)stats.p99,
+            (long long)stats.p999, (long long)stats.max,
+            (long long)stats.mean);
+    };
+
+    char tb_name[48];
+    std::snprintf(tb_name, sizeof(tb_name), "TapeBook<%d>", TAPE_N);
+
+    bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+    bench::OrderBookMap<PriceT, QtyT> obm;
+    bench::OrderBookVector<PriceT, QtyT> obv;
+    bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+
+    run_one(tb,   tb_name);
+    run_one(obm,  "OrderBookMap");
+    run_one(obv,  "OrderBookVector");
+    run_one(obvl, "OrderBookVectorLinear");
+
+    std::fprintf(stdout, "\n");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -404,6 +693,13 @@ int main() {
     run_mixed_suite("Uniform Random (range=500)", []() {
         return bench::WorkloadUniform<PriceT, QtyT>(SEED, ANCHOR, 500);
     });
+
+    // -----------------------------------------------------------------------
+    // Scenario benchmarks
+    // -----------------------------------------------------------------------
+    run_book_shift_bench();
+    run_bbo_improve_bench();
+    run_wide_market_midfill_bench();
 
     return 0;
 }
