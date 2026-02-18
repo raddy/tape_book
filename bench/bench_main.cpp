@@ -375,6 +375,106 @@ void bench_book_shift_impl(
     }
 }
 
+// Proactive-recenter variant: recenter happens OUTSIDE timing window
+template <int N>
+void bench_book_shift_proactive(
+    bench::TapeBookAdapter<N, PriceT, QtyT>& book, PriceT anchor,
+    int depth, int shifts, int shift_step,
+    bench::LatencyCollector& collector)
+{
+    std::mt19937_64 rng(SEED);
+
+    auto setup_book = [&](PriceT center) {
+        book.reset(center);
+        for (int d = 0; d < depth; ++d) {
+            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+            book.set_bid(static_cast<PriceT>(center - 1 - d), qty);
+            book.set_ask(static_cast<PriceT>(center + 1 + d), qty);
+        }
+    };
+
+    PriceT center = anchor;
+    setup_book(center);
+
+    bench::Timer timer;
+
+    for (int s = 0; s < shifts; ++s) {
+        PriceT old_center = center;
+        center = static_cast<PriceT>(
+            static_cast<int64_t>(center) + ((s & 1) ? shift_step : -shift_step));
+
+        bench::ClobberMemory();
+        timer.start();
+
+        for (int d = 0; d < depth; ++d) {
+            book.set_bid(static_cast<PriceT>(old_center - 1 - d), QtyT{0});
+            book.set_ask(static_cast<PriceT>(old_center + 1 + d), QtyT{0});
+        }
+        for (int d = 0; d < depth; ++d) {
+            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+            book.set_bid(static_cast<PriceT>(center - 1 - d), qty);
+            book.set_ask(static_cast<PriceT>(center + 1 + d), qty);
+        }
+
+        bench::ClobberMemory();
+        collector.record(timer.elapsed_ns());
+
+        // Recenter OFF the critical path (not timed)
+        book.proactive_recenter();
+    }
+}
+
+// Throughput variant: batch-timed, returns total ns for all shifts
+template <typename BookT>
+bench::ThroughputStats bench_book_shift_throughput(
+    BookT& book, PriceT anchor,
+    int depth, int shifts, int shift_step)
+{
+    std::mt19937_64 rng(SEED);
+
+    book.reset(anchor);
+    for (int d = 0; d < depth; ++d) {
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        book.set_bid(static_cast<PriceT>(anchor - 1 - d), qty);
+        book.set_ask(static_cast<PriceT>(anchor + 1 + d), qty);
+    }
+
+    PriceT center = anchor;
+
+    bench::ClobberMemory();
+    bench::Timer timer;
+    timer.start();
+
+    for (int s = 0; s < shifts; ++s) {
+        PriceT old_center = center;
+        center = static_cast<PriceT>(
+            static_cast<int64_t>(center) + ((s & 1) ? shift_step : -shift_step));
+
+        for (int d = 0; d < depth; ++d) {
+            book.set_bid(static_cast<PriceT>(old_center - 1 - d), QtyT{0});
+            book.set_ask(static_cast<PriceT>(old_center + 1 + d), QtyT{0});
+        }
+        for (int d = 0; d < depth; ++d) {
+            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+            book.set_bid(static_cast<PriceT>(center - 1 - d), qty);
+            book.set_ask(static_cast<PriceT>(center + 1 + d), qty);
+        }
+    }
+
+    bench::ClobberMemory();
+    int64_t elapsed = timer.elapsed_ns();
+
+    // Each shift = 2*depth set operations (depth cancels + depth inserts)
+    int64_t total_ops = static_cast<int64_t>(shifts) * 2 * depth;
+    bench::ThroughputStats stats;
+    stats.total_ns = elapsed;
+    stats.ops = total_ops;
+    stats.mops = (elapsed > 0)
+        ? static_cast<double>(total_ops) / (static_cast<double>(elapsed) / 1000.0)
+        : 0.0;
+    return stats;
+}
+
 void run_book_shift_bench() {
     constexpr int DEPTH = 5;       // 5 levels per side (typical L2 depth)
     constexpr int SHIFTS = 50'000;
@@ -390,40 +490,108 @@ void run_book_shift_bench() {
         std::fprintf(stdout,
             "\n=== Book Shift: %s, depth=%d, %d shifts ===\n\n",
             cfg.label, DEPTH, SHIFTS);
-        std::fprintf(stdout,
-            "  %-26s | %5s | %5s | %5s | %5s | %5s | %7s | %7s\n",
-            "Implementation", "p25", "p50", "p90", "p99", "mean", "max", "ns/shift");
-        std::fprintf(stdout,
-            "  %-26s-+-%5s-+-%5s-+-%5s-+-%5s-+-%5s-+-%7s-+-%7s\n",
-            "--------------------------", "-----", "-----", "-----",
-            "-----", "-----", "-------", "-------");
 
-        auto run_one = [&](auto& book, PriceT anchor, const char* name) {
-            bench::LatencyCollector collector;
-            collector.reserve(SHIFTS);
-            bench_book_shift_impl(book, anchor, DEPTH, SHIFTS, cfg.step, collector);
-            auto stats = collector.compute();
+        // -- Latency table --
+        std::fprintf(stdout, "  -- per-shift latency (ns) --\n");
+        std::fprintf(stdout,
+            "  %-26s | %5s | %5s | %5s | %5s | %5s | %7s | %5s\n",
+            "Implementation", "p25", "p50", "p90", "p99", "p99.9", "max", "mean");
+        std::fprintf(stdout,
+            "  %-26s-+-%5s-+-%5s-+-%5s-+-%5s-+-%5s-+-%7s-+-%5s\n",
+            "--------------------------", "-----", "-----", "-----",
+            "-----", "-----", "-------", "-----");
+
+        auto print_latency = [](const char* name, const bench::LatencyStats& s) {
             std::fprintf(stdout,
-                "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %7lld\n",
+                "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld\n",
                 name,
-                (long long)stats.p25, (long long)stats.p50,
-                (long long)stats.p90, (long long)stats.p99,
-                (long long)stats.mean, (long long)stats.max,
-                (long long)stats.mean);
+                (long long)s.p25, (long long)s.p50,
+                (long long)s.p90, (long long)s.p99,
+                (long long)s.p999, (long long)s.max,
+                (long long)s.mean);
         };
 
-        char tb_name[48];
+        char tb_name[48], tb_pro_name[48];
         std::snprintf(tb_name, sizeof(tb_name), "TapeBook<%d>", TAPE_N);
+        std::snprintf(tb_pro_name, sizeof(tb_pro_name), "TapeBook<%d> (proactive)", TAPE_N);
 
-        bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
-        bench::OrderBookMap<PriceT, QtyT> obm;
-        bench::OrderBookVector<PriceT, QtyT> obv;
-        bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+        // TapeBook (normal)
+        bench::LatencyStats tb_stats;
+        {
+            bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+            bench::LatencyCollector col; col.reserve(SHIFTS);
+            bench_book_shift_impl(tb, ANCHOR, DEPTH, SHIFTS, cfg.step, col);
+            tb_stats = col.compute();
+        }
+        print_latency(tb_name, tb_stats);
 
-        run_one(tb,   ANCHOR, tb_name);
-        run_one(obm,  ANCHOR, "OrderBookMap");
-        run_one(obv,  ANCHOR, "OrderBookVector");
-        run_one(obvl, ANCHOR, "OrderBookVectorLinear");
+        // TapeBook (proactive recenter)
+        bench::LatencyStats tb_pro_stats;
+        {
+            bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+            bench::LatencyCollector col; col.reserve(SHIFTS);
+            bench_book_shift_proactive(tb, ANCHOR, DEPTH, SHIFTS, cfg.step, col);
+            tb_pro_stats = col.compute();
+        }
+        print_latency(tb_pro_name, tb_pro_stats);
+
+        // Reference implementations
+        bench::LatencyStats obm_stats, obv_stats, obvl_stats;
+        {
+            bench::OrderBookMap<PriceT, QtyT> obm;
+            bench::LatencyCollector col; col.reserve(SHIFTS);
+            bench_book_shift_impl(obm, ANCHOR, DEPTH, SHIFTS, cfg.step, col);
+            obm_stats = col.compute();
+        }
+        print_latency("OrderBookMap", obm_stats);
+        {
+            bench::OrderBookVector<PriceT, QtyT> obv;
+            bench::LatencyCollector col; col.reserve(SHIFTS);
+            bench_book_shift_impl(obv, ANCHOR, DEPTH, SHIFTS, cfg.step, col);
+            obv_stats = col.compute();
+        }
+        print_latency("OrderBookVector", obv_stats);
+        {
+            bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+            bench::LatencyCollector col; col.reserve(SHIFTS);
+            bench_book_shift_impl(obvl, ANCHOR, DEPTH, SHIFTS, cfg.step, col);
+            obvl_stats = col.compute();
+        }
+        print_latency("OrderBookVectorLinear", obvl_stats);
+
+        // -- Throughput table --
+        std::fprintf(stdout, "\n  -- throughput (batch-timed, ops = shifts * 2 * depth) --\n");
+        std::fprintf(stdout,
+            "  %-26s | %12s | %10s | %7s\n",
+            "Implementation", "total_ns", "ops", "Mops/s");
+        std::fprintf(stdout,
+            "  %-26s-+-%12s-+-%10s-+-%7s\n",
+            "--------------------------", "------------",
+            "----------", "-------");
+
+        auto print_thr = [](const char* name, const bench::ThroughputStats& s) {
+            std::fprintf(stdout,
+                "  %-26s | %12lld | %10lld | %7.1f\n",
+                name,
+                (long long)s.total_ns, (long long)s.ops, s.mops);
+        };
+
+        {
+            bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+            print_thr(tb_name, bench_book_shift_throughput(tb, ANCHOR, DEPTH, SHIFTS, cfg.step));
+        }
+        {
+            bench::OrderBookMap<PriceT, QtyT> obm;
+            print_thr("OrderBookMap", bench_book_shift_throughput(obm, ANCHOR, DEPTH, SHIFTS, cfg.step));
+        }
+        {
+            bench::OrderBookVector<PriceT, QtyT> obv;
+            print_thr("OrderBookVector", bench_book_shift_throughput(obv, ANCHOR, DEPTH, SHIFTS, cfg.step));
+        }
+        {
+            bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+            print_thr("OrderBookVectorLinear", bench_book_shift_throughput(obvl, ANCHOR, DEPTH, SHIFTS, cfg.step));
+        }
     }
     std::fprintf(stdout, "\n");
 }
@@ -435,12 +603,145 @@ void run_book_shift_bench() {
 // by setting a new best bid (1 tick better) or new best ask (1 tick better).
 // Times each individual BBO-improving operation.
 // ---------------------------------------------------------------------------
+
+// Generic per-op latency for BBO improvement
+template <typename BookT>
+bench::LatencyStats bench_bbo_improve_latency(BookT& book, int depth, int ops) {
+    std::mt19937_64 rng(SEED);
+    bench::LatencyCollector collector;
+    collector.reserve(static_cast<size_t>(ops));
+    bench::Timer timer;
+
+    book.reset(ANCHOR);
+    for (int d = 0; d < depth; ++d) {
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
+        book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
+    }
+
+    PriceT best_bid = static_cast<PriceT>(ANCHOR - 1);
+    PriceT best_ask = static_cast<PriceT>(ANCHOR + 1);
+
+    for (int i = 0; i < ops; ++i) {
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        bool improve_bid = (i & 1) != 0;
+
+        bench::ClobberMemory();
+        timer.start();
+
+        if (improve_bid) {
+            best_bid = static_cast<PriceT>(best_bid + 1);
+            book.set_bid(best_bid, qty);
+        } else {
+            best_ask = static_cast<PriceT>(best_ask - 1);
+            book.set_ask(best_ask, qty);
+        }
+
+        bench::ClobberMemory();
+        collector.record(timer.elapsed_ns());
+    }
+
+    return collector.compute();
+}
+
+// TapeBook proactive-recenter variant
+template <int N>
+bench::LatencyStats bench_bbo_improve_proactive(
+    bench::TapeBookAdapter<N, PriceT, QtyT>& book, int depth, int ops)
+{
+    std::mt19937_64 rng(SEED);
+    bench::LatencyCollector collector;
+    collector.reserve(static_cast<size_t>(ops));
+    bench::Timer timer;
+
+    book.reset(ANCHOR);
+    for (int d = 0; d < depth; ++d) {
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
+        book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
+    }
+
+    PriceT best_bid = static_cast<PriceT>(ANCHOR - 1);
+    PriceT best_ask = static_cast<PriceT>(ANCHOR + 1);
+
+    for (int i = 0; i < ops; ++i) {
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        bool improve_bid = (i & 1) != 0;
+
+        bench::ClobberMemory();
+        timer.start();
+
+        if (improve_bid) {
+            best_bid = static_cast<PriceT>(best_bid + 1);
+            book.set_bid(best_bid, qty);
+        } else {
+            best_ask = static_cast<PriceT>(best_ask - 1);
+            book.set_ask(best_ask, qty);
+        }
+
+        bench::ClobberMemory();
+        collector.record(timer.elapsed_ns());
+
+        // Recenter OFF the critical path (not timed)
+        book.proactive_recenter();
+    }
+
+    return collector.compute();
+}
+
+// Batch-timed throughput for BBO improvement
+template <typename BookT>
+bench::ThroughputStats bench_bbo_improve_throughput(BookT& book, int depth, int ops) {
+    std::mt19937_64 rng(SEED);
+
+    book.reset(ANCHOR);
+    for (int d = 0; d < depth; ++d) {
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
+        book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
+    }
+
+    PriceT best_bid = static_cast<PriceT>(ANCHOR - 1);
+    PriceT best_ask = static_cast<PriceT>(ANCHOR + 1);
+
+    bench::ClobberMemory();
+    bench::Timer timer;
+    timer.start();
+
+    for (int i = 0; i < ops; ++i) {
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        bool improve_bid = (i & 1) != 0;
+
+        if (improve_bid) {
+            best_bid = static_cast<PriceT>(best_bid + 1);
+            book.set_bid(best_bid, qty);
+        } else {
+            best_ask = static_cast<PriceT>(best_ask - 1);
+            book.set_ask(best_ask, qty);
+        }
+    }
+
+    bench::ClobberMemory();
+    int64_t elapsed = timer.elapsed_ns();
+
+    bench::ThroughputStats stats;
+    stats.total_ns = elapsed;
+    stats.ops = ops;
+    stats.mops = (elapsed > 0)
+        ? static_cast<double>(ops) / (static_cast<double>(elapsed) / 1000.0)
+        : 0.0;
+    return stats;
+}
+
 void run_bbo_improve_bench() {
     constexpr int DEPTH = 10;
     constexpr int OPS = 100'000;
 
     std::fprintf(stdout,
         "\n=== BBO Improvement (uptick/downtick), %d ops ===\n\n", OPS);
+
+    // -- Latency table --
+    std::fprintf(stdout, "  -- per-op latency (ns) --\n");
     std::fprintf(stdout,
         "  %-26s | %5s | %5s | %5s | %5s | %5s | %7s | %5s\n",
         "Implementation", "p25", "p50", "p90", "p99", "p99.9", "max", "mean");
@@ -449,66 +750,71 @@ void run_bbo_improve_bench() {
         "--------------------------", "-----", "-----", "-----",
         "-----", "-----", "-------", "-----");
 
-    auto run_one = [&](auto& book, const char* name) {
-        std::mt19937_64 rng(SEED);
-        bench::LatencyCollector collector;
-        collector.reserve(OPS);
-        bench::Timer timer;
-
-        // Start fresh for each run
-        book.reset(ANCHOR);
-
-        // Set up initial depth
-        for (int d = 0; d < DEPTH; ++d) {
-            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-            book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
-            book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
-        }
-
-        PriceT best_bid = static_cast<PriceT>(ANCHOR - 1);
-        PriceT best_ask = static_cast<PriceT>(ANCHOR + 1);
-
-        for (int i = 0; i < OPS; ++i) {
-            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-            bool improve_bid = (i & 1) != 0;
-
-            bench::ClobberMemory();
-            timer.start();
-
-            if (improve_bid) {
-                best_bid = static_cast<PriceT>(best_bid + 1);
-                book.set_bid(best_bid, qty);
-            } else {
-                best_ask = static_cast<PriceT>(best_ask - 1);
-                book.set_ask(best_ask, qty);
-            }
-
-            bench::ClobberMemory();
-            collector.record(timer.elapsed_ns());
-        }
-
-        auto stats = collector.compute();
+    auto print_latency = [](const char* name, const bench::LatencyStats& s) {
         std::fprintf(stdout,
             "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld\n",
             name,
-            (long long)stats.p25, (long long)stats.p50,
-            (long long)stats.p90, (long long)stats.p99,
-            (long long)stats.p999, (long long)stats.max,
-            (long long)stats.mean);
+            (long long)s.p25, (long long)s.p50,
+            (long long)s.p90, (long long)s.p99,
+            (long long)s.p999, (long long)s.max,
+            (long long)s.mean);
     };
 
-    char tb_name[48];
+    char tb_name[48], tb_pro_name[48];
     std::snprintf(tb_name, sizeof(tb_name), "TapeBook<%d>", TAPE_N);
+    std::snprintf(tb_pro_name, sizeof(tb_pro_name), "TapeBook<%d> (proactive)", TAPE_N);
 
-    bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
-    bench::OrderBookMap<PriceT, QtyT> obm;
-    bench::OrderBookVector<PriceT, QtyT> obv;
-    bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+    // TapeBook (normal)
+    {
+        bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+        print_latency(tb_name, bench_bbo_improve_latency(tb, DEPTH, OPS));
+    }
+    // TapeBook (proactive recenter)
+    {
+        bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+        print_latency(tb_pro_name, bench_bbo_improve_proactive(tb, DEPTH, OPS));
+    }
+    // References
+    {
+        bench::OrderBookMap<PriceT, QtyT> obm;
+        print_latency("OrderBookMap", bench_bbo_improve_latency(obm, DEPTH, OPS));
+    }
+    {
+        bench::OrderBookVector<PriceT, QtyT> obv;
+        print_latency("OrderBookVector", bench_bbo_improve_latency(obv, DEPTH, OPS));
+    }
+    {
+        bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+        print_latency("OrderBookVectorLinear", bench_bbo_improve_latency(obvl, DEPTH, OPS));
+    }
 
-    run_one(tb,   tb_name);
-    run_one(obm,  "OrderBookMap");
-    run_one(obv,  "OrderBookVector");
-    run_one(obvl, "OrderBookVectorLinear");
+    // -- Throughput table --
+    std::fprintf(stdout, "\n");
+    bench::print_throughput_header();
+
+    auto print_thr = [](const char* name, const bench::ThroughputStats& s) {
+        std::fprintf(stdout,
+            "  %-26s | %12lld | %10lld | %7.1f\n",
+            name,
+            (long long)s.total_ns, (long long)s.ops, s.mops);
+    };
+
+    {
+        bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+        print_thr(tb_name, bench_bbo_improve_throughput(tb, DEPTH, OPS));
+    }
+    {
+        bench::OrderBookMap<PriceT, QtyT> obm;
+        print_thr("OrderBookMap", bench_bbo_improve_throughput(obm, DEPTH, OPS));
+    }
+    {
+        bench::OrderBookVector<PriceT, QtyT> obv;
+        print_thr("OrderBookVector", bench_bbo_improve_throughput(obv, DEPTH, OPS));
+    }
+    {
+        bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+        print_thr("OrderBookVectorLinear", bench_bbo_improve_throughput(obvl, DEPTH, OPS));
+    }
 
     std::fprintf(stdout, "\n");
 }
@@ -520,13 +826,147 @@ void run_bbo_improve_bench() {
 // Repeatedly insert a level somewhere in the mid-spread region, then cancel
 // it. Times the insert (the speed-race-sensitive path).
 // ---------------------------------------------------------------------------
-void run_wide_market_midfill_bench() {
-    constexpr int HALF_SPREAD = 50;   // 100-tick wide market
-    constexpr int OPS = 100'000;
+static constexpr int MIDFILL_HALF_SPREAD = 50;   // 100-tick wide market
+static constexpr int MIDFILL_OPS = 100'000;
 
+// Generic per-op latency
+template <typename BookT>
+bench::LatencyStats bench_midfill_latency(BookT& book) {
+    std::mt19937_64 rng(SEED);
+    bench::LatencyCollector collector;
+    collector.reserve(MIDFILL_OPS);
+    bench::Timer timer;
+
+    book.reset(ANCHOR);
+    for (int d = 0; d < 5; ++d) {
+        book.set_bid(static_cast<PriceT>(ANCHOR - MIDFILL_HALF_SPREAD - d),
+                     static_cast<QtyT>(100));
+        book.set_ask(static_cast<PriceT>(ANCHOR + MIDFILL_HALF_SPREAD + d),
+                     static_cast<QtyT>(100));
+    }
+
+    for (int i = 0; i < MIDFILL_OPS; ++i) {
+        PriceT mid_px = static_cast<PriceT>(
+            ANCHOR - MIDFILL_HALF_SPREAD + 1 +
+            static_cast<int64_t>(rng() % static_cast<uint64_t>(MIDFILL_HALF_SPREAD * 2 - 1)));
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        bool is_bid = (i & 1) != 0;
+
+        bench::ClobberMemory();
+        timer.start();
+
+        if (is_bid) book.set_bid(mid_px, qty);
+        else        book.set_ask(mid_px, qty);
+
+        bench::ClobberMemory();
+        collector.record(timer.elapsed_ns());
+
+        // Cancel so spread stays wide
+        if (is_bid) book.set_bid(mid_px, QtyT{0});
+        else        book.set_ask(mid_px, QtyT{0});
+    }
+
+    return collector.compute();
+}
+
+// TapeBook proactive-recenter variant
+template <int N>
+bench::LatencyStats bench_midfill_proactive(
+    bench::TapeBookAdapter<N, PriceT, QtyT>& book)
+{
+    std::mt19937_64 rng(SEED);
+    bench::LatencyCollector collector;
+    collector.reserve(MIDFILL_OPS);
+    bench::Timer timer;
+
+    book.reset(ANCHOR);
+    for (int d = 0; d < 5; ++d) {
+        book.set_bid(static_cast<PriceT>(ANCHOR - MIDFILL_HALF_SPREAD - d),
+                     static_cast<QtyT>(100));
+        book.set_ask(static_cast<PriceT>(ANCHOR + MIDFILL_HALF_SPREAD + d),
+                     static_cast<QtyT>(100));
+    }
+
+    for (int i = 0; i < MIDFILL_OPS; ++i) {
+        PriceT mid_px = static_cast<PriceT>(
+            ANCHOR - MIDFILL_HALF_SPREAD + 1 +
+            static_cast<int64_t>(rng() % static_cast<uint64_t>(MIDFILL_HALF_SPREAD * 2 - 1)));
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        bool is_bid = (i & 1) != 0;
+
+        bench::ClobberMemory();
+        timer.start();
+
+        if (is_bid) book.set_bid(mid_px, qty);
+        else        book.set_ask(mid_px, qty);
+
+        bench::ClobberMemory();
+        collector.record(timer.elapsed_ns());
+
+        // Cancel (untimed)
+        if (is_bid) book.set_bid(mid_px, QtyT{0});
+        else        book.set_ask(mid_px, QtyT{0});
+
+        // Proactive recenter OFF the critical path
+        book.proactive_recenter();
+    }
+
+    return collector.compute();
+}
+
+// Batch-timed throughput
+template <typename BookT>
+bench::ThroughputStats bench_midfill_throughput(BookT& book) {
+    std::mt19937_64 rng(SEED);
+
+    book.reset(ANCHOR);
+    for (int d = 0; d < 5; ++d) {
+        book.set_bid(static_cast<PriceT>(ANCHOR - MIDFILL_HALF_SPREAD - d),
+                     static_cast<QtyT>(100));
+        book.set_ask(static_cast<PriceT>(ANCHOR + MIDFILL_HALF_SPREAD + d),
+                     static_cast<QtyT>(100));
+    }
+
+    bench::ClobberMemory();
+    bench::Timer timer;
+    timer.start();
+
+    for (int i = 0; i < MIDFILL_OPS; ++i) {
+        PriceT mid_px = static_cast<PriceT>(
+            ANCHOR - MIDFILL_HALF_SPREAD + 1 +
+            static_cast<int64_t>(rng() % static_cast<uint64_t>(MIDFILL_HALF_SPREAD * 2 - 1)));
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        bool is_bid = (i & 1) != 0;
+
+        if (is_bid) book.set_bid(mid_px, qty);
+        else        book.set_ask(mid_px, qty);
+
+        // Cancel so spread stays wide
+        if (is_bid) book.set_bid(mid_px, QtyT{0});
+        else        book.set_ask(mid_px, QtyT{0});
+    }
+
+    bench::ClobberMemory();
+    int64_t elapsed = timer.elapsed_ns();
+
+    // 2 ops per iteration (insert + cancel)
+    int64_t total_ops = static_cast<int64_t>(MIDFILL_OPS) * 2;
+    bench::ThroughputStats stats;
+    stats.total_ns = elapsed;
+    stats.ops = total_ops;
+    stats.mops = (elapsed > 0)
+        ? static_cast<double>(total_ops) / (static_cast<double>(elapsed) / 1000.0)
+        : 0.0;
+    return stats;
+}
+
+void run_wide_market_midfill_bench() {
     std::fprintf(stdout,
         "\n=== Wide Market Mid-Fill (spread=%d, %d ops) ===\n\n",
-        HALF_SPREAD * 2, OPS);
+        MIDFILL_HALF_SPREAD * 2, MIDFILL_OPS);
+
+    // -- Latency table --
+    std::fprintf(stdout, "  -- per-op latency (ns, insert only) --\n");
     std::fprintf(stdout,
         "  %-26s | %5s | %5s | %5s | %5s | %5s | %7s | %5s\n",
         "Implementation", "p25", "p50", "p90", "p99", "p99.9", "max", "mean");
@@ -535,74 +975,68 @@ void run_wide_market_midfill_bench() {
         "--------------------------", "-----", "-----", "-----",
         "-----", "-----", "-------", "-----");
 
-    auto run_one = [&](auto& book, const char* name) {
-        std::mt19937_64 rng(SEED);
-        bench::LatencyCollector collector;
-        collector.reserve(OPS);
-        bench::Timer timer;
-
-        // Set up wide book: bid side has a few levels near ANCHOR-50,
-        // ask side has a few levels near ANCHOR+50
-        book.reset(ANCHOR);
-        for (int d = 0; d < 5; ++d) {
-            book.set_bid(static_cast<PriceT>(ANCHOR - HALF_SPREAD - d),
-                         static_cast<QtyT>(100));
-            book.set_ask(static_cast<PriceT>(ANCHOR + HALF_SPREAD + d),
-                         static_cast<QtyT>(100));
-        }
-
-        // The spread is [ANCHOR-50, ANCHOR+50] -- 100 ticks wide
-        // Now repeatedly insert a bid in the mid-spread (improving the bid
-        // into the "theo" region), time it, then cancel it
-        for (int i = 0; i < OPS; ++i) {
-            // Random price in the mid-spread, closer to current ask
-            // (this is the "someone joins at 20 when market is 5@25" scenario)
-            PriceT mid_px = static_cast<PriceT>(
-                ANCHOR - HALF_SPREAD + 1 +
-                static_cast<int64_t>(rng() % static_cast<uint64_t>(HALF_SPREAD * 2 - 1)));
-            QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-            bool is_bid = (i & 1) != 0;
-
-            bench::ClobberMemory();
-            timer.start();
-
-            if (is_bid)
-                book.set_bid(mid_px, qty);
-            else
-                book.set_ask(mid_px, qty);
-
-            bench::ClobberMemory();
-            collector.record(timer.elapsed_ns());
-
-            // Cancel it so the spread stays wide for the next op
-            if (is_bid)
-                book.set_bid(mid_px, QtyT{0});
-            else
-                book.set_ask(mid_px, QtyT{0});
-        }
-
-        auto stats = collector.compute();
+    auto print_latency = [](const char* name, const bench::LatencyStats& s) {
         std::fprintf(stdout,
             "  %-26s | %5lld | %5lld | %5lld | %5lld | %5lld | %7lld | %5lld\n",
             name,
-            (long long)stats.p25, (long long)stats.p50,
-            (long long)stats.p90, (long long)stats.p99,
-            (long long)stats.p999, (long long)stats.max,
-            (long long)stats.mean);
+            (long long)s.p25, (long long)s.p50,
+            (long long)s.p90, (long long)s.p99,
+            (long long)s.p999, (long long)s.max,
+            (long long)s.mean);
     };
 
-    char tb_name[48];
+    char tb_name[48], tb_pro_name[48];
     std::snprintf(tb_name, sizeof(tb_name), "TapeBook<%d>", TAPE_N);
+    std::snprintf(tb_pro_name, sizeof(tb_pro_name), "TapeBook<%d> (proactive)", TAPE_N);
 
-    bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
-    bench::OrderBookMap<PriceT, QtyT> obm;
-    bench::OrderBookVector<PriceT, QtyT> obv;
-    bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+    {
+        bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+        print_latency(tb_name, bench_midfill_latency(tb));
+    }
+    {
+        bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+        print_latency(tb_pro_name, bench_midfill_proactive(tb));
+    }
+    {
+        bench::OrderBookMap<PriceT, QtyT> obm;
+        print_latency("OrderBookMap", bench_midfill_latency(obm));
+    }
+    {
+        bench::OrderBookVector<PriceT, QtyT> obv;
+        print_latency("OrderBookVector", bench_midfill_latency(obv));
+    }
+    {
+        bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+        print_latency("OrderBookVectorLinear", bench_midfill_latency(obvl));
+    }
 
-    run_one(tb,   tb_name);
-    run_one(obm,  "OrderBookMap");
-    run_one(obv,  "OrderBookVector");
-    run_one(obvl, "OrderBookVectorLinear");
+    // -- Throughput table --
+    std::fprintf(stdout, "\n");
+    bench::print_throughput_header();
+
+    auto print_thr = [](const char* name, const bench::ThroughputStats& s) {
+        std::fprintf(stdout,
+            "  %-26s | %12lld | %10lld | %7.1f\n",
+            name,
+            (long long)s.total_ns, (long long)s.ops, s.mops);
+    };
+
+    {
+        bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
+        print_thr(tb_name, bench_midfill_throughput(tb));
+    }
+    {
+        bench::OrderBookMap<PriceT, QtyT> obm;
+        print_thr("OrderBookMap", bench_midfill_throughput(obm));
+    }
+    {
+        bench::OrderBookVector<PriceT, QtyT> obv;
+        print_thr("OrderBookVector", bench_midfill_throughput(obv));
+    }
+    {
+        bench::OrderBookVectorLinear<PriceT, QtyT> obvl;
+        print_thr("OrderBookVectorLinear", bench_midfill_throughput(obvl));
+    }
 
     std::fprintf(stdout, "\n");
 }

@@ -204,6 +204,38 @@ struct TapeBookAdapter {
 
     [[nodiscard]] PriceT best_bid_px() const { return book.best_bid_px(); }
     [[nodiscard]] PriceT best_ask_px() const { return book.best_ask_px(); }
+
+    // Proactive recenter: call OFF the critical path to keep the tape
+    // centered around the current BBO.  Models the realistic pattern
+    // where you process the MD tick (timed), then check/recenter (untimed).
+    void proactive_recenter() {
+        using TB = tape_book::TapeBook<N, PriceT, QtyT>;
+        constexpr int64_t MARGIN = N / 4;
+        auto& core = book.core;
+
+        // Bids: best_bid is the highest price in tape.
+        // If it's near the top of the tape window, recenter.
+        PriceT best_bid = book.best_bid_px();
+        if (best_bid != tape_book::lowest_px<PriceT>()) {
+            PriceT bid_anchor = core.bids.anchor();
+            int64_t bid_top = static_cast<int64_t>(bid_anchor) + N - 1;
+            if (static_cast<int64_t>(best_bid) > bid_top - MARGIN) {
+                PriceT new_anchor = TB::compute_anchor(best_bid, N / 2);
+                book.recenter_bid(new_anchor);
+            }
+        }
+
+        // Asks: best_ask is the lowest price in tape.
+        // If it's near the bottom of the tape window, recenter.
+        PriceT best_ask = book.best_ask_px();
+        if (best_ask != tape_book::highest_px<PriceT>()) {
+            PriceT ask_anchor = core.asks.anchor();
+            if (static_cast<int64_t>(best_ask) < static_cast<int64_t>(ask_anchor) + MARGIN) {
+                PriceT new_anchor = TB::compute_anchor(best_ask, N / 2);
+                book.recenter_ask(new_anchor);
+            }
+        }
+    }
 };
 
 }  // namespace bench
