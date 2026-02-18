@@ -53,6 +53,7 @@ template <typename PriceT>
 
 }  // namespace tape_book
 
+#include <cassert>
 #include <cstdlib>
 #include <cstring>
 
