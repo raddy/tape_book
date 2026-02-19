@@ -597,14 +597,28 @@ void run_book_shift_bench() {
 }
 
 // ---------------------------------------------------------------------------
-// bench_bbo_improve -- uptick/downtick: how fast is a new best price?
+// bench_bbo_improve -- oscillating BBO: how fast is a new best price?
 //
 // Sets up a book with `depth` levels, then repeatedly improves the BBO
-// by setting a new best bid (1 tick better) or new best ask (1 tick better).
-// Times each individual BBO-improving operation.
+// via a random walk. Each op: pick bid or ask (random), move it 1-3 ticks
+// better, cancel the old worst level to maintain constant depth.
+// The walk oscillates naturally (no monotonic drift), modeling real
+// microstructure where the BBO bounces around.
 // ---------------------------------------------------------------------------
 
-// Generic per-op latency for BBO improvement
+// Helper: set up initial book state and return {best_bid, best_ask}
+template <typename BookT>
+std::pair<PriceT, PriceT> setup_bbo_book(BookT& book, int depth, std::mt19937_64& rng) {
+    book.reset(ANCHOR);
+    for (int d = 0; d < depth; ++d) {
+        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
+        book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
+        book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
+    }
+    return {static_cast<PriceT>(ANCHOR - 1), static_cast<PriceT>(ANCHOR + 1)};
+}
+
+// Generic per-op latency for BBO improvement (oscillating walk)
 template <typename BookT>
 bench::LatencyStats bench_bbo_improve_latency(BookT& book, int depth, int ops) {
     std::mt19937_64 rng(SEED);
@@ -612,29 +626,30 @@ bench::LatencyStats bench_bbo_improve_latency(BookT& book, int depth, int ops) {
     collector.reserve(static_cast<size_t>(ops));
     bench::Timer timer;
 
-    book.reset(ANCHOR);
-    for (int d = 0; d < depth; ++d) {
-        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-        book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
-        book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
-    }
-
-    PriceT best_bid = static_cast<PriceT>(ANCHOR - 1);
-    PriceT best_ask = static_cast<PriceT>(ANCHOR + 1);
+    auto [best_bid, best_ask] = setup_bbo_book(book, depth, rng);
+    PriceT worst_bid = static_cast<PriceT>(best_bid - depth + 1);
+    PriceT worst_ask = static_cast<PriceT>(best_ask + depth - 1);
 
     for (int i = 0; i < ops; ++i) {
         QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-        bool improve_bid = (i & 1) != 0;
+        bool improve_bid = (rng() & 1) != 0;
+        int step = 1 + static_cast<int>(rng() % 3);  // 1-3 ticks
 
         bench::ClobberMemory();
         timer.start();
 
         if (improve_bid) {
-            best_bid = static_cast<PriceT>(best_bid + 1);
+            // New best bid, cancel old worst bid
+            best_bid = static_cast<PriceT>(best_bid + step);
             book.set_bid(best_bid, qty);
+            book.set_bid(worst_bid, QtyT{0});
+            worst_bid = static_cast<PriceT>(worst_bid + step);
         } else {
-            best_ask = static_cast<PriceT>(best_ask - 1);
+            // New best ask, cancel old worst ask
+            best_ask = static_cast<PriceT>(best_ask - step);
             book.set_ask(best_ask, qty);
+            book.set_ask(worst_ask, QtyT{0});
+            worst_ask = static_cast<PriceT>(worst_ask - step);
         }
 
         bench::ClobberMemory();
@@ -644,7 +659,7 @@ bench::LatencyStats bench_bbo_improve_latency(BookT& book, int depth, int ops) {
     return collector.compute();
 }
 
-// TapeBook proactive-recenter variant
+// TapeBook proactive-recenter variant (oscillating walk)
 template <int N>
 bench::LatencyStats bench_bbo_improve_proactive(
     bench::TapeBookAdapter<N, PriceT, QtyT>& book, int depth, int ops)
@@ -654,29 +669,28 @@ bench::LatencyStats bench_bbo_improve_proactive(
     collector.reserve(static_cast<size_t>(ops));
     bench::Timer timer;
 
-    book.reset(ANCHOR);
-    for (int d = 0; d < depth; ++d) {
-        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-        book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
-        book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
-    }
-
-    PriceT best_bid = static_cast<PriceT>(ANCHOR - 1);
-    PriceT best_ask = static_cast<PriceT>(ANCHOR + 1);
+    auto [best_bid, best_ask] = setup_bbo_book(book, depth, rng);
+    PriceT worst_bid = static_cast<PriceT>(best_bid - depth + 1);
+    PriceT worst_ask = static_cast<PriceT>(best_ask + depth - 1);
 
     for (int i = 0; i < ops; ++i) {
         QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-        bool improve_bid = (i & 1) != 0;
+        bool improve_bid = (rng() & 1) != 0;
+        int step = 1 + static_cast<int>(rng() % 3);
 
         bench::ClobberMemory();
         timer.start();
 
         if (improve_bid) {
-            best_bid = static_cast<PriceT>(best_bid + 1);
+            best_bid = static_cast<PriceT>(best_bid + step);
             book.set_bid(best_bid, qty);
+            book.set_bid(worst_bid, QtyT{0});
+            worst_bid = static_cast<PriceT>(worst_bid + step);
         } else {
-            best_ask = static_cast<PriceT>(best_ask - 1);
+            best_ask = static_cast<PriceT>(best_ask - step);
             book.set_ask(best_ask, qty);
+            book.set_ask(worst_ask, QtyT{0});
+            worst_ask = static_cast<PriceT>(worst_ask - step);
         }
 
         bench::ClobberMemory();
@@ -689,20 +703,14 @@ bench::LatencyStats bench_bbo_improve_proactive(
     return collector.compute();
 }
 
-// Batch-timed throughput for BBO improvement
+// Batch-timed throughput for BBO improvement (oscillating walk)
 template <typename BookT>
 bench::ThroughputStats bench_bbo_improve_throughput(BookT& book, int depth, int ops) {
     std::mt19937_64 rng(SEED);
 
-    book.reset(ANCHOR);
-    for (int d = 0; d < depth; ++d) {
-        QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-        book.set_bid(static_cast<PriceT>(ANCHOR - 1 - d), qty);
-        book.set_ask(static_cast<PriceT>(ANCHOR + 1 + d), qty);
-    }
-
-    PriceT best_bid = static_cast<PriceT>(ANCHOR - 1);
-    PriceT best_ask = static_cast<PriceT>(ANCHOR + 1);
+    auto [best_bid, best_ask] = setup_bbo_book(book, depth, rng);
+    PriceT worst_bid = static_cast<PriceT>(best_bid - depth + 1);
+    PriceT worst_ask = static_cast<PriceT>(best_ask + depth - 1);
 
     bench::ClobberMemory();
     bench::Timer timer;
@@ -710,14 +718,19 @@ bench::ThroughputStats bench_bbo_improve_throughput(BookT& book, int depth, int 
 
     for (int i = 0; i < ops; ++i) {
         QtyT qty = static_cast<QtyT>(100 + rng() % 400);
-        bool improve_bid = (i & 1) != 0;
+        bool improve_bid = (rng() & 1) != 0;
+        int step = 1 + static_cast<int>(rng() % 3);
 
         if (improve_bid) {
-            best_bid = static_cast<PriceT>(best_bid + 1);
+            best_bid = static_cast<PriceT>(best_bid + step);
             book.set_bid(best_bid, qty);
+            book.set_bid(worst_bid, QtyT{0});
+            worst_bid = static_cast<PriceT>(worst_bid + step);
         } else {
-            best_ask = static_cast<PriceT>(best_ask - 1);
+            best_ask = static_cast<PriceT>(best_ask - step);
             book.set_ask(best_ask, qty);
+            book.set_ask(worst_ask, QtyT{0});
+            worst_ask = static_cast<PriceT>(worst_ask - step);
         }
     }
 
@@ -738,7 +751,8 @@ void run_bbo_improve_bench() {
     constexpr int OPS = 100'000;
 
     std::fprintf(stdout,
-        "\n=== BBO Improvement (uptick/downtick), %d ops ===\n\n", OPS);
+        "\n=== BBO Improvement (oscillating walk, depth=%d), %d ops ===\n\n",
+        DEPTH, OPS);
 
     // -- Latency table --
     std::fprintf(stdout, "  -- per-op latency (ns) --\n");
@@ -764,17 +778,14 @@ void run_bbo_improve_bench() {
     std::snprintf(tb_name, sizeof(tb_name), "TapeBook<%d>", TAPE_N);
     std::snprintf(tb_pro_name, sizeof(tb_pro_name), "TapeBook<%d> (proactive)", TAPE_N);
 
-    // TapeBook (normal)
     {
         bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
         print_latency(tb_name, bench_bbo_improve_latency(tb, DEPTH, OPS));
     }
-    // TapeBook (proactive recenter)
     {
         bench::TapeBookAdapter<TAPE_N, PriceT, QtyT> tb(SPILL_CAP);
         print_latency(tb_pro_name, bench_bbo_improve_proactive(tb, DEPTH, OPS));
     }
-    // References
     {
         bench::OrderBookMap<PriceT, QtyT> obm;
         print_latency("OrderBookMap", bench_bbo_improve_latency(obm, DEPTH, OPS));

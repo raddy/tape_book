@@ -195,11 +195,11 @@ struct TapeBookAdapter {
     void reset(PriceT anchor) { book.reset(anchor); }
 
     void set_bid(PriceT px, QtyT qty) {
-        book.set(true, px, qty);
+        book.template set<true>(px, qty);
     }
 
     void set_ask(PriceT px, QtyT qty) {
-        book.set(false, px, qty);
+        book.template set<false>(px, qty);
     }
 
     [[nodiscard]] PriceT best_bid_px() const { return book.best_bid_px(); }
