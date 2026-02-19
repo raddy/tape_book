@@ -53,6 +53,7 @@ template <typename PriceT>
 
 }  // namespace tape_book
 
+#include <cassert>
 #include <cstdlib>
 #include <cstring>
 
@@ -467,7 +468,8 @@ class Tape {
   alignas(64) QtyT qty[N]{};
   alignas(64) u64  bits[WORDS]{};
   PriceT anchor_px{0};
-  i32    best_idx{IsBid ? -1 : N};
+  mutable i32  best_idx{IsBid ? -1 : N};
+  mutable bool best_dirty{false};
 
   static constexpr i64 N64 = static_cast<i64>(N);
   static constexpr i32 N32 = static_cast<i32>(N);
@@ -476,6 +478,13 @@ class Tape {
     return (d == std::numeric_limits<i64>::min())
       ? static_cast<u64>(std::numeric_limits<i64>::max()) + 1u
       : static_cast<u64>(d >= 0 ? d : -d);
+  }
+
+  TB_ALWAYS_INLINE void resolve_best() const noexcept {
+    if (TB_UNLIKELY(best_dirty)) {
+      best_idx = IsBid ? scan_prev_set(best_idx) : scan_next_set(best_idx);
+      best_dirty = false;
+    }
   }
 
  public:
@@ -493,6 +502,7 @@ class Tape {
     std::memset(bits, 0, sizeof(bits));
     anchor_px = anchor;
     best_idx  = IsBid ? -1 : N;
+    best_dirty = false;
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE PriceT anchor() const noexcept { return anchor_px; }
@@ -507,6 +517,7 @@ class Tape {
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE PriceT best_px() const noexcept {
+    resolve_best();
     if constexpr (IsBid) {
       return (best_idx < 0) ? lowest_px<PriceT>() : price_from_idx(best_idx);
     } else {
@@ -515,6 +526,7 @@ class Tape {
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE QtyT best_qty() const noexcept {
+    resolve_best();
     if constexpr (IsBid) {
       return (best_idx < 0) ? QtyT{0} : qty[best_idx];
     } else {
@@ -523,6 +535,7 @@ class Tape {
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE bool is_empty() const noexcept {
+    resolve_best();
     if constexpr (IsBid) return best_idx < 0;
     else                 return best_idx >= N32;
   }
@@ -535,6 +548,7 @@ class Tape {
         expect |= (u64)(qty[(size_t)(base + b)] != QtyT{0}) << b;
       if (bits[(size_t)w] != expect) return false;
     }
+    resolve_best();
     const i32 scan = IsBid ? scan_prev_set(N32 - 1) : scan_next_set(0);
     return scan == best_idx;
   }
@@ -569,7 +583,8 @@ class Tape {
       cell = QtyT{0};
       bits[(size_t)w] &= ~m;
       if (i == best_idx) {
-        best_idx = IsBid ? scan_prev_set(i - 1) : scan_next_set(i + 1);
+        best_idx = IsBid ? (i - 1) : (i + 1);
+        best_dirty = true;
       }
       return UpdateResult::Erase;
     } else {
@@ -577,9 +592,9 @@ class Tape {
       cell = q;
       bits[(size_t)w] |= m;
       if constexpr (IsBid) {
-        if (i > best_idx) best_idx = i;
+        if (i >= best_idx) { best_idx = i; best_dirty = false; }
       } else {
-        if (i < best_idx) best_idx = i;
+        if (i <= best_idx) { best_idx = i; best_dirty = false; }
       }
       return rc;
     }
@@ -633,6 +648,7 @@ class Tape {
     }
 
     best_idx = IsBid ? scan_prev_set(N32 - 1) : scan_next_set(0);
+    best_dirty = false;
   }
 
   template <class Sink>
@@ -669,6 +685,7 @@ class Tape {
 
   template <typename Fn, typename Sink>
   TB_ALWAYS_INLINE void iterate_from_best(Fn&& fn, Sink&& sink) const noexcept {
+    resolve_best();
     if constexpr (IsBid) {
       for (i32 idx = best_idx; idx >= 0; idx = scan_prev_set(idx - 1)) {
         if (!fn(price_from_idx(idx), qty[idx])) return;
@@ -704,6 +721,7 @@ class Tape {
 
   void erase_range(i32 start_idx, i32 end_idx) noexcept {
     if (start_idx > end_idx) return;
+    resolve_best();
     for_each_set(start_idx, end_idx, [this](i32 i) { qty[i] = QtyT{0}; });
 
     i32 start_word = start_idx >> 6;
@@ -721,6 +739,7 @@ class Tape {
     } else {
       if (best_idx <= end_idx)   best_idx = scan_next_set(end_idx + 1);
     }
+    best_dirty = false;
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE i32 scan_prev_set(i32 idx) const noexcept {

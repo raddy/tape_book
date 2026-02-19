@@ -7,6 +7,15 @@
 
 namespace tape_book {
 
+// TODO: Two-layer tape optimization for BBO-hot workloads.
+// Idea: add a tiny sorted array (4-8 entries per side) in front of the tape
+// that always holds the best K levels. best_px()/best_qty() become a direct
+// array read (no bitset scan). Canceling the best just falls through to the
+// next entry in the hot buffer — only refill from the tape when the buffer
+// runs low. Promotion/demotion between hot buffer and tape on insert/erase.
+// Main benefit: guaranteed L1-resident BBO data (~64 bytes vs 2KB+ tape).
+// Main cost: extra routing branch on every set(), recenter must drain/refill.
+
 template <i32 N, typename PriceT, typename QtyT>
 struct TapeBook {
   using price_type = PriceT;
