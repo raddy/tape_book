@@ -164,6 +164,41 @@ static void test_pool_backed_book() {
   std::cout << "  pool_backed_book ... OK\n";
 }
 
+static void test_pool_backed_reserve_spill() {
+  SpillPool<i32, u32> pool(65536);
+  Book<64, i32, u32> b(1024, &pool);
+  b.reset(1000);
+
+  assert(pool.used_levels() == 0);
+  b.set<true>(5000, 42u);
+  b.set<true>(5100, 77u);
+  b.set<false>(100, 99u);
+  b.set<false>(50, 88u);
+  assert(pool.used_levels() == 32);
+  assert(b.core.spill.bid.cap == 16);
+  assert(b.core.spill.ask.cap == 16);
+  assert(b.core.spill.bid.n == 2);
+  assert(b.core.spill.ask.n == 2);
+  assert(b.best_bid_px() == 5100);
+  assert(b.best_bid_qty() == 77u);
+  assert(b.best_ask_px() == 50);
+  assert(b.best_ask_qty() == 88u);
+
+  b.reserve_spill();
+  assert(pool.used_levels() == 2080);
+  assert(b.core.spill.bid.cap == 1024);
+  assert(b.core.spill.ask.cap == 1024);
+  assert(b.core.spill.bid.n == 2);
+  assert(b.core.spill.ask.n == 2);
+  assert(b.best_bid_px() == 5100);
+  assert(b.best_bid_qty() == 77u);
+  assert(b.best_ask_px() == 50);
+  assert(b.best_ask_qty() == 88u);
+  assert(b.verify_invariants());
+
+  std::cout << "  pool_backed_reserve_spill ... OK\n";
+}
+
 static void test_pool_backed_move() {
   SpillPool<i32, u32> pool(65536);
 
@@ -313,6 +348,7 @@ int main() {
 
   std::cout << "\n=== Pool-backed Book ===\n";
   test_pool_backed_book();
+  test_pool_backed_reserve_spill();
   test_pool_backed_move();
   test_pool_multi_book_stress();
   test_pool_backed_multibook_pool3();
