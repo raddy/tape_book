@@ -79,6 +79,40 @@ static void test_spill_buffer() {
   assert(b.verify_invariants());
 }
 
+static void test_reserve_spill_malloc() {
+  BookT b(512);
+  b.reset(1000);
+  assert(b.core.spill.bid.cap == 0);
+  assert(b.core.spill.ask.cap == 0);
+
+  b.set<true>(2000, 15);
+  b.set<true>(2200, 25);
+  b.set<false>(100, 20);
+  b.set<false>(50, 30);
+  assert(b.core.spill.bid.cap == 16);
+  assert(b.core.spill.ask.cap == 16);
+  assert(b.core.spill.bid.n == 2);
+  assert(b.core.spill.ask.n == 2);
+  assert(b.best_bid_px() == 2200);
+  assert(b.best_bid_qty() == 25);
+  assert(b.best_ask_px() == 50);
+  assert(b.best_ask_qty() == 30);
+
+  b.reserve_spill();
+
+  assert(b.core.spill.bid.cap == 512);
+  assert(b.core.spill.ask.cap == 512);
+  assert(b.core.spill.bid.a != nullptr);
+  assert(b.core.spill.ask.a != nullptr);
+  assert(b.core.spill.bid.n == 2);
+  assert(b.core.spill.ask.n == 2);
+  assert(b.best_bid_px() == 2200);
+  assert(b.best_bid_qty() == 25);
+  assert(b.best_ask_px() == 50);
+  assert(b.best_ask_qty() == 30);
+  assert(b.verify_invariants());
+}
+
 static void test_crossed_states() {
   BookT b(512);
   b.reset(1000);
@@ -349,6 +383,7 @@ static void test_nullsink_interface() {
 int main() {
   test_basic_operations();
   test_spill_buffer();
+  test_reserve_spill_malloc();
   test_crossed_states();
   test_erase_better();
   test_anchor_and_recentering();

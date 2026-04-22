@@ -223,6 +223,10 @@ struct Book {
     core.recenter_ask(new_anchor);
   }
 
+  TB_ALWAYS_INLINE void reserve_spill() noexcept {
+    core.spill.reserve();
+  }
+
   [[nodiscard]] TB_ALWAYS_INLINE bool verify_invariants() const noexcept {
     return core.bids.verify_invariants() && core.asks.verify_invariants();
   }

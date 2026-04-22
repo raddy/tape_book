@@ -119,6 +119,24 @@ struct SideDynamic {
     cap = new_cap;
   }
 
+  TB_ALWAYS_INLINE void reserve_cap(pool_type* pool) noexcept {
+    if (cap >= max_cap) return;
+    level_type* p;
+    if (pool) {
+      p = pool->reallocate(a, cap, max_cap, n);
+    } else {
+      p = static_cast<level_type*>(std::malloc(static_cast<size_t>(max_cap) * sizeof(level_type)));
+      if (!p) return;
+      if (a) {
+        std::memcpy(p, a, static_cast<size_t>(n) * sizeof(level_type));
+        std::free(a);
+      }
+    }
+    if (!p) return;
+    a = p;
+    cap = max_cap;
+  }
+
   template <bool IsBid>
   TB_ALWAYS_INLINE void add_point(price_type px, qty_type q, pool_type* pool) noexcept {
     if (n == cap && cap < max_cap) ensure_cap(pool);
@@ -295,6 +313,11 @@ struct DynSpillBuffer {
   TB_ALWAYS_INLINE void release() noexcept {
     bid.release(pool_);
     ask.release(pool_);
+  }
+
+  TB_ALWAYS_INLINE void reserve() noexcept {
+    bid.reserve_cap(pool_);
+    ask.reserve_cap(pool_);
   }
 
   template <bool IsBid>
@@ -798,6 +821,15 @@ class Tape {
 
 namespace tape_book {
 
+// TODO: Two-layer tape optimization for BBO-hot workloads.
+// Idea: add a tiny sorted array (4-8 entries per side) in front of the tape
+// that always holds the best K levels. best_px()/best_qty() become a direct
+// array read (no bitset scan). Canceling the best just falls through to the
+// next entry in the hot buffer — only refill from the tape when the buffer
+// runs low. Promotion/demotion between hot buffer and tape on insert/erase.
+// Main benefit: guaranteed L1-resident BBO data (~64 bytes vs 2KB+ tape).
+// Main cost: extra routing branch on every set(), recenter must drain/refill.
+
 template <i32 N, typename PriceT, typename QtyT>
 struct TapeBook {
   using price_type = PriceT;
@@ -1003,6 +1035,10 @@ struct Book {
 
   TB_ALWAYS_INLINE void recenter_ask(price_type new_anchor) noexcept {
     core.recenter_ask(new_anchor);
+  }
+
+  TB_ALWAYS_INLINE void reserve_spill() noexcept {
+    core.spill.reserve();
   }
 
   [[nodiscard]] TB_ALWAYS_INLINE bool verify_invariants() const noexcept {
